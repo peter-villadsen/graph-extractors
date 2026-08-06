@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# .NET
+bin/
+obj/
+*.user
+
+# Claude Code local settings (per-machine, not for sharing)
+**/.claude/settings.local.json
+
+# OS cruft
+.DS_Store
+Thumbs.db

@@ -1,0 +1,436 @@
+using System.Linq;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Xunit;
+
+namespace CSharpToCypher.Tests;
+
+public class CypherFormattingTests
+{
+    [Fact]
+    public void EscapeString_escapes_quotes_backslashes_and_control_chars()
+    {
+        Assert.Equal("a\\'b\\\\c\\n\\t", Cypher.EscapeString("a'b\\c\n\t"));
+    }
+
+    [Fact]
+    public void FormatValue_renders_primitives()
+    {
+        Assert.Equal("true", Cypher.FormatValue(true));
+        Assert.Equal("42", Cypher.FormatValue(42));
+        Assert.Equal("'hi'", Cypher.FormatValue("hi"));
+        Assert.Equal("['a', 1]", Cypher.FormatValue(new object?[] { "a", 1 }));
+        Assert.Equal("null", Cypher.FormatValue(null));
+    }
+}
+
+public class GraphBuilderTests
+{
+    private static CypherDocument Build(string source, string file = "test.cs")
+    {
+        var root = (CompilationUnitSyntax)CSharpSyntaxTree.ParseText(source).GetRoot();
+        return new GraphBuilder(file).Build(root);
+    }
+
+    private static CypherDocument BuildWithModel(string source, string file = "test.cs")
+    {
+        var tree = (CSharpSyntaxTree)CSharpSyntaxTree.ParseText(source, path: file);
+        var references = ((string?)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES"))
+            ?.Split(Path.PathSeparator)
+            .Where(p => !string.IsNullOrEmpty(p) && File.Exists(p))
+            .Select(p => (MetadataReference)MetadataReference.CreateFromFile(p))
+            .ToArray() ?? Array.Empty<MetadataReference>();
+        var compilation = CSharpCompilation.Create("Test", new[] { tree }, references);
+        var model = compilation.GetSemanticModel(tree);
+        return new GraphBuilder(file, model).Build((CompilationUnitSyntax)tree.GetRoot());
+    }
+
+    [Fact]
+    public void CompilationUnit_node_emitted_first()
+    {
+        var doc = Build("class A { }");
+        var root = doc.Nodes.First();
+        Assert.Contains("CSharpCompilationUnit", root.Labels);
+        Assert.Equal("test.cs", root.Properties["name"]);
+    }
+
+    [Fact]
+    public void Class_derives_and_declares_method()
+    {
+        var doc = Build("class Dog : Animal { void Bark() { } }");
+        var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
+        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
+        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DECLARES"));
+    }
+
+    [Fact]
+    public void Class_with_interface_only_base_list_does_not_derive()
+    {
+        var doc = BuildWithModel("interface IDisposable2 { } class Logger : IDisposable2 { }");
+        var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration") && n.Properties["name"] as string == "Logger");
+        Assert.False(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
+        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "IMPLEMENTS"));
+    }
+
+    [Fact]
+    public void Class_with_real_base_class_still_derives()
+    {
+        var doc = BuildWithModel("class Animal { } class Dog : Animal { }");
+        var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration") && n.Properties["name"] as string == "Dog");
+        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
+    }
+
+    [Fact]
+    public void Class_base_list_without_semantic_model_falls_back_to_positional_heuristic()
+    {
+        var doc = Build("class Dog : Animal { }");
+        var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
+        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
+    }
+
+    [Fact]
+    public void Interface_base_list_never_derives()
+    {
+        var doc = BuildWithModel("interface IBar { } interface IFoo : IBar { }");
+        var iface = doc.Nodes.First(n => n.Labels.Contains("CSharpInterfaceDeclaration") && n.Properties["name"] as string == "IFoo");
+        Assert.False(doc.Relationships.Any(r => r.Source == iface.Id && r.Type == "DERIVED_FROM"));
+        Assert.True(doc.Relationships.Any(r => r.Source == iface.Id && r.Type == "IMPLEMENTS"));
+    }
+
+    [Fact]
+    public void Struct_base_list_never_derives()
+    {
+        var doc = BuildWithModel("interface IFoo { } struct S : IFoo { }");
+        var s = doc.Nodes.First(n => n.Labels.Contains("CSharpStructDeclaration"));
+        Assert.False(doc.Relationships.Any(r => r.Source == s.Id && r.Type == "DERIVED_FROM"));
+        Assert.True(doc.Relationships.Any(r => r.Source == s.Id && r.Type == "IMPLEMENTS"));
+    }
+
+    [Fact]
+    public void Method_has_parameter_return_and_body()
+    {
+        var doc = Build("class C { int Add(int a, int b) { return a + b; } }");
+        var method = doc.Nodes.First(n => n.Labels.Contains("CSharpMethodDeclaration"));
+        Assert.Equal("Add", method.Properties["name"]);
+
+        var types = doc.Relationships.Where(r => r.Source == method.Id).Select(r => r.Type);
+        Assert.Contains("HAS_PARAMETER", types);
+        Assert.Contains("RETURNS", types);
+        Assert.Contains("HAS_BODY", types);
+
+        var paramsCount = doc.Relationships
+            .Where(r => r.Type == "HAS_PARAMETER" && r.Source == method.Id)
+            .Count();
+        Assert.Equal(2, paramsCount);
+    }
+
+    [Fact]
+    public void While_statement_has_condition_and_body()
+    {
+        var doc = Build("class C { void M() { while (x < 10) { x++; } } }");
+        var loop = doc.Nodes.First(n => n.Labels.Contains("CSharpWhileStatement"));
+        var types = doc.Relationships.Where(r => r.Source == loop.Id).Select(r => r.Type).Distinct();
+        Assert.Contains("HAS_CONDITION", types);
+        Assert.Contains("HAS_BODY", types);
+    }
+
+    [Fact]
+    public void Comment_becomes_trivia()
+    {
+        var doc = Build("// hello\nclass A { }");
+        var trivia = doc.Nodes.First(n => n.Labels.Contains("CSharpTrivia"));
+        Assert.True(doc.Relationships.Any(r => r.Type == "HAS_TRIVIA" && r.Target == trivia.Id));
+    }
+
+    [Fact]
+    public void Goto_and_yield_constructs_do_not_throw()
+    {
+        var source = "class C { int M() { goto Done; Done: return 1; } object N() { yield return 1; } }";
+        var doc = Build(source); // must not throw
+        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpGotoStatement")));
+        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpYieldStatement")));
+    }
+
+    [Fact]
+    public void Consecutive_statements_are_chained_with_follows()
+    {
+        var doc = Build("class C { void M() { int a = 1; int b = 2; int c = 3; } }");
+        var statements = doc.Nodes
+            .Where(n => n.Labels.Contains("CSharpLocalDeclarationStatement"))
+            .ToList();
+        Assert.Equal(3, statements.Count);
+
+        var follows = doc.Relationships.Where(r => r.Type == "FOLLOWS").ToList();
+        Assert.Equal(2, follows.Count);
+        Assert.Equal(follows[0].Source, statements[0].Id);
+        Assert.Equal(follows[0].Target, statements[1].Id);
+        Assert.Equal(follows[1].Source, statements[1].Id);
+        Assert.Equal(follows[1].Target, statements[2].Id);
+    }
+
+    [Fact]
+    public void Follows_edges_do_not_cross_block_boundaries()
+    {
+        var doc = Build("class C { void M() { if (a) { b(); c(); } d(); } }");
+        var follows = doc.Relationships.Where(r => r.Type == "FOLLOWS").ToList();
+        Assert.Equal(2, follows.Count);
+
+        // Inner if-body block: b() -> c()
+        var ifStmt = doc.Nodes.First(n => n.Labels.Contains("CSharpIfStatement"));
+        var innerBlock = doc.Relationships
+            .First(r => r.Type == "HAS_BODY" && r.Source == ifStmt.Id)
+            .Target;
+        var innerStatements = doc.Relationships
+            .Where(r => r.Type == "CONTAINS" && r.Source == innerBlock)
+            .Select(r => r.Target)
+            .ToList();
+        Assert.Equal(2, innerStatements.Count);
+        Assert.Contains(follows, f => f.Source == innerStatements[0] && f.Target == innerStatements[1]);
+
+        // Outer block: if statement -> d()
+        Assert.Contains(follows, f => f.Source == ifStmt.Id);
+    }
+
+    [Fact]
+    public void Nodes_carry_source_coordinates()
+    {
+        var doc = Build("class C {\n    void M() { return; }\n}");
+        var method = doc.Nodes.First(n => n.Labels.Contains("CSharpMethodDeclaration"));
+        Assert.Equal(2, method.Properties["startLine"]);
+        Assert.Equal(4, method.Properties["startColumn"]);
+        Assert.Equal(2, method.Properties["endLine"]);
+        Assert.Equal(24, method.Properties["endColumn"]);
+        Assert.True(method.Properties.ContainsKey("startOffset"));
+        Assert.True(method.Properties.ContainsKey("endOffset"));
+    }
+
+    [Fact]
+    public void Symbol_references_record_kind_and_type()
+    {
+        var doc = BuildWithModel("class C { int Field; void M() { int x = Field; System.Console.WriteLine(x); } }");
+        var field = doc.Nodes.First(n =>
+            n.Labels.Contains("CSharpIdentifierName") && n.Properties["name"] as string == "Field");
+        Assert.Equal("Field", field.Properties["symbolKind"]);
+        Assert.Equal("int", field.Properties["symbolType"]);
+
+        var local = doc.Nodes.First(n =>
+            n.Labels.Contains("CSharpIdentifierName") && n.Properties["name"] as string == "x");
+        Assert.Equal("Local", local.Properties["symbolKind"]);
+        Assert.Equal("int", local.Properties["symbolType"]);
+    }
+
+    [Fact]
+    public void Invocation_resolves_to_method_symbol()
+    {
+        var doc = BuildWithModel("class C { void M() { System.Console.WriteLine(1); } }");
+        var call = doc.Nodes.First(n => n.Labels.Contains("CSharpInvocationExpression"));
+        Assert.Equal("Method", call.Properties["symbolKind"]);
+        Assert.Equal("void", call.Properties["symbolType"]);
+    }
+
+    [Fact]
+    public void Calls_edge_from_enclosing_method_to_callee()
+    {
+        var doc = BuildWithModel("class C { void A() { B(); } void B() { } }");
+        var methodA = doc.Nodes.First(n =>
+            n.Labels.Contains("CSharpMethodDeclaration") && n.Properties["name"] as string == "A");
+
+        var calls = doc.Relationships.Where(r => r.Type == "CALLS").ToList();
+        Assert.Single(calls);
+        Assert.Equal(methodA.Id, calls[0].Source);
+
+        var callee = doc.Nodes.First(n => n.Id == calls[0].Target);
+        Assert.Equal("CSharpSymbol", callee.Labels[0]);
+        Assert.Equal("Method", callee.Properties["symbolKind"]);
+        Assert.Equal("C.B()", callee.Properties["symbolName"]);
+    }
+
+    [Fact]
+    public void Repeated_calls_to_same_symbol_share_one_callee_node()
+    {
+        var doc = BuildWithModel("class C { void A() { B(); B(); B(); } void B() { } }");
+        var calls = doc.Relationships.Where(r => r.Type == "CALLS").ToList();
+        Assert.Equal(3, calls.Count);
+        Assert.Single(calls.Select(c => c.Target).Distinct());
+
+        var calleeNodes = doc.Nodes.Where(n => n.Labels.Contains("CSharpSymbol")).ToList();
+        Assert.Single(calleeNodes);
+    }
+
+    [Fact]
+    public void Argument_ref_kind_is_recorded_as_booleans()
+    {
+        var doc = Build("class C { void M(ref int a, out int b, in int c, int d) { M(ref a, out b, in c, d); } }");
+        var args = doc.Nodes.Where(n => n.Labels.Contains("CSharpArgument")).ToList();
+        Assert.Equal(4, args.Count);
+
+        Assert.True((bool)args[0].Properties["isRef"]!);
+        Assert.False((bool)args[0].Properties["isOut"]!);
+        Assert.False((bool)args[0].Properties["isIn"]!);
+
+        Assert.False((bool)args[1].Properties["isRef"]!);
+        Assert.True((bool)args[1].Properties["isOut"]!);
+        Assert.False((bool)args[1].Properties["isIn"]!);
+
+        Assert.False((bool)args[2].Properties["isRef"]!);
+        Assert.False((bool)args[2].Properties["isOut"]!);
+        Assert.True((bool)args[2].Properties["isIn"]!);
+
+        Assert.False((bool)args[3].Properties["isRef"]!);
+        Assert.False((bool)args[3].Properties["isOut"]!);
+        Assert.False((bool)args[3].Properties["isIn"]!);
+    }
+
+    [Fact]
+    public void Interpolated_string_holes_are_traversed()
+    {
+        var doc = Build("class C { void M(string name, int count) { var s = $\"Hello {name}, you have {count} items\"; } }");
+        var interpolated = doc.Nodes.First(n => n.Labels.Contains("CSharpInterpolatedStringExpression"));
+        var holes = doc.Relationships
+            .Where(r => r.Source == interpolated.Id && r.Type == "HAS_OPERAND")
+            .Select(r => doc.Nodes.First(n => n.Id == r.Target))
+            .ToList();
+        Assert.Equal(2, holes.Count);
+        Assert.Contains(holes, h => h.Properties.TryGetValue("name", out var n) && n as string == "name");
+        Assert.Contains(holes, h => h.Properties.TryGetValue("name", out var n) && n as string == "count");
+    }
+
+    [Fact]
+    public void Top_level_statement_is_not_dropped()
+    {
+        var root = (CompilationUnitSyntax)CSharpSyntaxTree.ParseText("System.Console.WriteLine(\"hi\");").GetRoot();
+        var doc = new GraphBuilder("test.cs").Build(root);
+        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpExpressionStatement")));
+        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpInvocationExpression")));
+    }
+
+    [Fact]
+    public void Comment_attached_exactly_once()
+    {
+        var doc = Build("// hello\nclass C { }\n");
+        var triviaCount = doc.Nodes.Count(n => n.Labels.Contains("CSharpTrivia"));
+        Assert.Equal(1, triviaCount);
+        var classNode = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
+        Assert.True(doc.Relationships.Any(r => r.Type == "HAS_TRIVIA" && r.Source == classNode.Id));
+    }
+
+    [Fact]
+    public void Comment_after_opening_brace_is_captured()
+    {
+        var doc = Build("class C { void M() { // inner\n } }");
+        var trivia = doc.Nodes.Where(n => n.Labels.Contains("CSharpTrivia")).ToList();
+        Assert.Single(trivia);
+        var block = doc.Nodes.First(n => n.Labels.Contains("CSharpBlock"));
+        Assert.True(doc.Relationships.Any(r => r.Type == "HAS_TRIVIA" && r.Source == block.Id));
+    }
+
+    [Fact]
+    public void Full_cfg_emits_basic_blocks_and_conditional_branches()
+    {
+        var doc = BuildWithModel("class C { void M() { while (x < 10) { y++; } z(); } }");
+        var blocks = doc.Nodes.Where(n => n.Labels.Contains("CSharpBasicBlock")).ToList();
+        Assert.True(blocks.Count >= 3);
+
+        var blockEdges = doc.Relationships.Where(r => r.Type == "FOLLOWS"
+            && blocks.Any(b => b.Id == r.Source)
+            && blocks.Any(b => b.Id == r.Target)).ToList();
+        Assert.True(blockEdges.Count >= 2);
+
+        // A conditional block has a whenTrue successor.
+        Assert.Contains(blockEdges, e => e.Properties?.ContainsKey("whenTrue") == true);
+    }
+
+    [Fact]
+    public void Cfg_blocks_link_to_contained_statements()
+    {
+        var doc = BuildWithModel("class C { void M() { int a = 1; return; } }");
+        var blocks = doc.Nodes.Where(n => n.Labels.Contains("CSharpBasicBlock")).ToList();
+        var linked = doc.Relationships.Where(r =>
+            r.Type == "CONTAINS" && blocks.Any(b => b.Id == r.Source)).ToList();
+        Assert.True(linked.Count > 0);
+    }
+}
+
+public class SouffleWriterTests
+{
+    private static CypherDocument BuildWithModel(string source, string file = "test.cs")
+    {
+        var tree = (CSharpSyntaxTree)CSharpSyntaxTree.ParseText(source, path: file);
+        var references = ((string?)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES"))
+            ?.Split(Path.PathSeparator)
+            .Where(p => !string.IsNullOrEmpty(p) && File.Exists(p))
+            .Select(p => (MetadataReference)MetadataReference.CreateFromFile(p))
+            .ToArray() ?? Array.Empty<MetadataReference>();
+        var compilation = CSharpCompilation.Create("Test", new[] { tree }, references);
+        var model = compilation.GetSemanticModel(tree);
+        return new GraphBuilder(file, model).Build((CompilationUnitSyntax)tree.GetRoot());
+    }
+
+    private static string Render(string source)
+    {
+        var writer = new SouffleWriter();
+        writer.AddCfg(BuildWithModel(source));
+        return writer.Render();
+    }
+
+    [Fact]
+    public void Render_includes_decls_facts_and_rules()
+    {
+        var text = Render("class C { void M() { while (x < 10) { y++; } z(); } }");
+        Assert.Contains(".decl basic_block(", text);
+        Assert.Contains(".decl control_flow_edge(", text);
+        Assert.Contains(".decl block_statement(", text);
+        Assert.Contains("basic_block(", text);
+        Assert.Contains("control_flow_edge(", text);
+        Assert.Contains("block_statement(", text);
+        Assert.Contains("reachable(Id, Function) :- basic_block(Id, Function, _, 1, _).", text);
+        Assert.Contains(".output reachable", text);
+        Assert.Contains(".output path", text);
+    }
+
+    [Fact]
+    public void Block_ids_are_remapped_to_global_b_ids()
+    {
+        var text = Render("class C { void M() { return; } }");
+        Assert.Contains("basic_block(\"b1\"", text);
+    }
+
+    [Fact]
+    public void Blocks_carry_scope_entry_and_final_flags()
+    {
+        var doc = BuildWithModel("class C { void M() { return; } }");
+        var blocks = doc.Nodes.Where(n => n.Labels.Contains("CSharpBasicBlock")).ToList();
+        var first = blocks.First();
+        Assert.True(first.Properties.ContainsKey("scope"));
+        Assert.Equal("C.M()", first.Properties["scope"]);
+        Assert.True(blocks.Any(b => (bool)b.Properties["isEntry"]));
+        Assert.True(blocks.Any(b => (bool)b.Properties["isFinal"]));
+    }
+
+    [Fact]
+    public void Edge_condition_records_branch_semantics()
+    {
+        var text = Render("class C { void M() { if (x) { y(); } z(); } }");
+        Assert.Contains("control_flow_edge(", text);
+    }
+
+    [Fact]
+    public void Symbols_are_escaped()
+    {
+        var text = Render("class C { void M() { return; } }");
+        Assert.Contains("basic_block(\"b1\", \"C.M()\"", text);
+    }
+
+    [Fact]
+    public void Multiple_files_share_one_program_with_remapped_ids()
+    {
+        var writer = new SouffleWriter();
+        writer.AddCfg(BuildWithModel("class C { void M() { return; } }", "a.cs"));
+        writer.AddCfg(BuildWithModel("class D { void N() { return; } }", "b.cs"));
+        var text = writer.Render();
+        Assert.Contains("basic_block(\"b1\"", text);
+        Assert.Contains("basic_block(\"b2\"", text);
+        Assert.Contains("\"D.N()\"", text);
+    }
+}
