@@ -11,6 +11,9 @@ bin/
 obj/
 *.user
 
+# Visual Studio
+.vs/
+
 # Claude Code local settings (per-machine, not for sharing)
 **/.claude/settings.local.json
 
