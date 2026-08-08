@@ -60,8 +60,8 @@ public class GraphBuilderTests
     {
         var doc = Build("class Dog : Animal { void Bark() { } }");
         var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
-        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
-        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DECLARES"));
+        Assert.Contains(doc.Relationships, r => r.Source == cls.Id && r.Type == "DERIVED_FROM");
+        Assert.Contains(doc.Relationships, r => r.Source == cls.Id && r.Type == "DECLARES");
     }
 
     [Fact]
@@ -69,8 +69,8 @@ public class GraphBuilderTests
     {
         var doc = BuildWithModel("interface IDisposable2 { } class Logger : IDisposable2 { }");
         var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration") && n.Properties["name"] as string == "Logger");
-        Assert.False(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
-        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "IMPLEMENTS"));
+        Assert.DoesNotContain(doc.Relationships, r => r.Source == cls.Id && r.Type == "DERIVED_FROM");
+        Assert.Contains(doc.Relationships, r => r.Source == cls.Id && r.Type == "IMPLEMENTS");
     }
 
     [Fact]
@@ -78,7 +78,7 @@ public class GraphBuilderTests
     {
         var doc = BuildWithModel("class Animal { } class Dog : Animal { }");
         var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration") && n.Properties["name"] as string == "Dog");
-        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
+        Assert.Contains(doc.Relationships, r => r.Source == cls.Id && r.Type == "DERIVED_FROM");
     }
 
     [Fact]
@@ -86,7 +86,7 @@ public class GraphBuilderTests
     {
         var doc = Build("class Dog : Animal { }");
         var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
-        Assert.True(doc.Relationships.Any(r => r.Source == cls.Id && r.Type == "DERIVED_FROM"));
+        Assert.Contains(doc.Relationships, r => r.Source == cls.Id && r.Type == "DERIVED_FROM");
     }
 
     [Fact]
@@ -94,8 +94,8 @@ public class GraphBuilderTests
     {
         var doc = BuildWithModel("interface IBar { } interface IFoo : IBar { }");
         var iface = doc.Nodes.First(n => n.Labels.Contains("CSharpInterfaceDeclaration") && n.Properties["name"] as string == "IFoo");
-        Assert.False(doc.Relationships.Any(r => r.Source == iface.Id && r.Type == "DERIVED_FROM"));
-        Assert.True(doc.Relationships.Any(r => r.Source == iface.Id && r.Type == "IMPLEMENTS"));
+        Assert.DoesNotContain(doc.Relationships, r => r.Source == iface.Id && r.Type == "DERIVED_FROM");
+        Assert.Contains(doc.Relationships, r => r.Source == iface.Id && r.Type == "IMPLEMENTS");
     }
 
     [Fact]
@@ -103,8 +103,8 @@ public class GraphBuilderTests
     {
         var doc = BuildWithModel("interface IFoo { } struct S : IFoo { }");
         var s = doc.Nodes.First(n => n.Labels.Contains("CSharpStructDeclaration"));
-        Assert.False(doc.Relationships.Any(r => r.Source == s.Id && r.Type == "DERIVED_FROM"));
-        Assert.True(doc.Relationships.Any(r => r.Source == s.Id && r.Type == "IMPLEMENTS"));
+        Assert.DoesNotContain(doc.Relationships, r => r.Source == s.Id && r.Type == "DERIVED_FROM");
+        Assert.Contains(doc.Relationships, r => r.Source == s.Id && r.Type == "IMPLEMENTS");
     }
 
     [Fact]
@@ -140,7 +140,7 @@ public class GraphBuilderTests
     {
         var doc = Build("// hello\nclass A { }");
         var trivia = doc.Nodes.First(n => n.Labels.Contains("CSharpTrivia"));
-        Assert.True(doc.Relationships.Any(r => r.Type == "HAS_TRIVIA" && r.Target == trivia.Id));
+        Assert.Contains(doc.Relationships, r => r.Type == "HAS_TRIVIA" && r.Target == trivia.Id);
     }
 
     [Fact]
@@ -148,8 +148,8 @@ public class GraphBuilderTests
     {
         var source = "class C { int M() { goto Done; Done: return 1; } object N() { yield return 1; } }";
         var doc = Build(source); // must not throw
-        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpGotoStatement")));
-        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpYieldStatement")));
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpGotoStatement"));
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpYieldStatement"));
     }
 
     [Fact]
@@ -301,8 +301,8 @@ public class GraphBuilderTests
     {
         var root = (CompilationUnitSyntax)CSharpSyntaxTree.ParseText("System.Console.WriteLine(\"hi\");").GetRoot();
         var doc = new GraphBuilder("test.cs").Build(root);
-        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpExpressionStatement")));
-        Assert.True(doc.Nodes.Any(n => n.Labels.Contains("CSharpInvocationExpression")));
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpExpressionStatement"));
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpInvocationExpression"));
     }
 
     [Fact]
@@ -312,7 +312,7 @@ public class GraphBuilderTests
         var triviaCount = doc.Nodes.Count(n => n.Labels.Contains("CSharpTrivia"));
         Assert.Equal(1, triviaCount);
         var classNode = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
-        Assert.True(doc.Relationships.Any(r => r.Type == "HAS_TRIVIA" && r.Source == classNode.Id));
+        Assert.Contains(doc.Relationships, r => r.Type == "HAS_TRIVIA" && r.Source == classNode.Id);
     }
 
     [Fact]
@@ -322,7 +322,7 @@ public class GraphBuilderTests
         var trivia = doc.Nodes.Where(n => n.Labels.Contains("CSharpTrivia")).ToList();
         Assert.Single(trivia);
         var block = doc.Nodes.First(n => n.Labels.Contains("CSharpBlock"));
-        Assert.True(doc.Relationships.Any(r => r.Type == "HAS_TRIVIA" && r.Source == block.Id));
+        Assert.Contains(doc.Relationships, r => r.Type == "HAS_TRIVIA" && r.Source == block.Id);
     }
 
     [Fact]
@@ -404,8 +404,8 @@ public class SouffleWriterTests
         var first = blocks.First();
         Assert.True(first.Properties.ContainsKey("scope"));
         Assert.Equal("C.M()", first.Properties["scope"]);
-        Assert.True(blocks.Any(b => (bool)b.Properties["isEntry"]));
-        Assert.True(blocks.Any(b => (bool)b.Properties["isFinal"]));
+        Assert.Contains(blocks, b => b.Properties["isEntry"] is true);
+        Assert.Contains(blocks, b => b.Properties["isFinal"] is true);
     }
 
     [Fact]

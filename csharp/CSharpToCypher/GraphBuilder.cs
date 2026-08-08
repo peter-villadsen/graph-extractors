@@ -63,9 +63,9 @@ public sealed class GraphBuilder
         return node.Id;
     }
 
-    private void AddRel(string? source, string type, string? target, IEnumerable<KeyValuePair<string, object?>>? properties = null)
+    private void AddRel(string? source, string? type, string? target, IEnumerable<KeyValuePair<string, object?>>? properties = null)
     {
-        if (source is null || target is null)
+        if (source is null || type is null || target is null)
         {
             return;
         }
