@@ -70,7 +70,13 @@ public sealed class CypherRelationship
         var propText = props is { Count: > 0 }
             ? " {" + string.Join(", ", props.Select(kv => $"{kv.Key}: {Cypher.FormatValue(kv.Value)}")) + "}"
             : "";
-        return $"CREATE ({Source})-[:{Type}{propText}]->({Target});";
+        // Each CREATE is its own autocommitted statement when pasted into the
+        // Neo4j Browser or piped through cypher-shell, so the variable bound by
+        // an earlier CREATE isn't visible here. Look both endpoints up by their
+        // `id` property instead of referencing the CREATE-time variable name.
+        var sourceId = Cypher.FormatValue(Source);
+        var targetId = Cypher.FormatValue(Target);
+        return $"MATCH (a {{id: {sourceId}}}), (b {{id: {targetId}}}) CREATE (a)-[:{Type}{propText}]->(b);";
     }
 }
 

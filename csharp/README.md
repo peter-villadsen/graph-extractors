@@ -155,6 +155,16 @@ C# function scopes use the resolved symbol (e.g. `SampleApp.Models.Dog.Fly()`).
 * **Idempotency**: the tool emits plain `CREATE` statements with unique,
   per-run ids (`n1`, `n2`, …). Re-importing duplicates the graph; clear the
   database first or use `MATCH (n) DETACH DELETE n` between runs.
+* **Performance**: relationship statements `MATCH` both endpoints by their
+  `id` property before `CREATE`ing the edge, rather than referencing the
+  `CREATE`-time variable name — each statement is its own autocommitted query
+  when pasted into the Neo4j Browser or piped through `cypher-shell`, so a
+  variable bound by an earlier `CREATE` isn't visible to a later one; without
+  the `MATCH`, the edge would silently create fresh, unlabeled, disconnected
+  nodes instead of linking the real ones. For large codebases, create an
+  index per node label on `id` first (e.g.
+  `CREATE INDEX FOR (n:CSharpDeclaration) ON (n.id);`) so those lookups
+  aren't full label scans.
 * **Trivia**: `SyntaxTrivia` includes whitespace and end-of-line trivia, which
   is filtered out; only comments and preprocessor directives are emitted.
 * **Expressions** are deliberately shallow "for now": operators are stored as
