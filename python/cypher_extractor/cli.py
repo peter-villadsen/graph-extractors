@@ -9,6 +9,7 @@ import sys
 
 from .ast_graph import GraphBuilder
 from .souffle import SouffleProgram
+from .writers import CypherStreamWriter, Neo4jAdminImportWriter
 
 EXTENSIONS = (".py",)
 
@@ -70,6 +71,29 @@ def main(argv=None) -> int:
             "instead of Cypher (implies --cfg)"
         ),
     )
+    parser.add_argument(
+        "--format",
+        choices=["cypher", "csv"],
+        default="cypher",
+        help=(
+            "'cypher' (default): stream CREATE/MATCH statements to stdout, one "
+            "autocommitted transaction per statement. 'csv': write neo4j-admin "
+            "bulk-import CSV files under --output-dir (one per node label set / "
+            "relationship type) and print the ready-to-run 'neo4j-admin database "
+            "import' command to stdout -- loads a large codebase into an empty "
+            "database in seconds instead of many small (or one huge) transactions"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default="neo4j-import",
+        help="directory for the CSV files (--format csv only, default: neo4j-import)",
+    )
+    parser.add_argument(
+        "--database",
+        default="neo4j",
+        help="database name for the generated import command (--format csv only, default: neo4j)",
+    )
     args = parser.parse_args(argv)
 
     files = collect_files(args.paths, EXTENSIONS)
@@ -78,6 +102,10 @@ def main(argv=None) -> int:
         return 2
 
     souffle = SouffleProgram() if args.emit_souffle else None
+    if args.format == "csv":
+        writer = Neo4jAdminImportWriter(args.output_dir, args.database, sys.stdout)
+    else:
+        writer = CypherStreamWriter(sys.stdout)
     next_id = 0
     for path in files:
         if args.verbose:
@@ -122,12 +150,11 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
 
-        for node in builder._nodes:
-            print(node.to_cypher())
-        for relationship in builder._relationships:
-            print(relationship.to_cypher())
+        writer.write(builder._nodes, builder._relationships)
 
     if souffle is not None:
         print(souffle.render(), end="")
+    else:
+        writer.finish()
 
     return 0

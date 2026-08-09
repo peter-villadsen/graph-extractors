@@ -14,8 +14,14 @@ for import into [Neo4j](https://neo4j.com/).
 * `--verbose` / `-v` — print progress information to **stderr**;
 * `--ast` / `-a` — print the AST before generating Cypher, to **stderr**;
 * `--souffle` — emit a **Souffle datalog** program for the control-flow graphs
-  on **stdout** instead of Cypher, see [Souffle datalog](#souffle-datalog)
+  on **stdout** instead of a graph, see [Souffle datalog](#souffle-datalog)
   below;
+* `--format cypher|csv` — output format, see [Output formats](#output-formats)
+  below (default `cypher`);
+* `--output-dir DIR` — directory for the CSV files (`--format csv` only,
+  default `neo4j-import`);
+* `--database NAME` — database name for the generated import command
+  (`--format csv` only, default `neo4j`);
 * `--help` / `-h` — usage help.
 
 The CFG is emitted unconditionally (there is no `--cfg` flag, unlike the
@@ -27,6 +33,41 @@ Python extractor).
 ```bash
 dotnet run --project csharp/CSharpToCypher -- csharp/samples/sample.cs | cypher-shell
 ```
+
+## Output formats
+
+`--format cypher` (default) streams `CREATE`/`MATCH` statements to stdout, as
+above — each one is its own autocommitted transaction, which doesn't scale to
+a large codebase (many small transactions, or one huge one if you batch it
+yourself).
+
+`--format csv` instead writes
+[`neo4j-admin database import`](https://neo4j.com/docs/operations-manual/current/import/)
+CSV files under `--output-dir`, and prints the ready-to-run import command on
+stdout instead of graph data:
+
+```bash
+dotnet run --project csharp/CSharpToCypher -- --format csv --output-dir out csharp/samples/sample.cs
+# neo4j-admin database import full --multiline-fields=true --nodes=out/nodes/CSharpClassDeclaration_CSharpDeclaration.csv --nodes=... --relationships=CONTAINS=out/relationships/CONTAINS.csv --relationships=... neo4j
+
+# stop the target dbms first, then run the printed command (an example):
+neo4j-admin database import full --multiline-fields=true --nodes=out/nodes/CSharpClassDeclaration_CSharpDeclaration.csv --relationships=CONTAINS=out/relationships/CONTAINS.csv neo4j
+```
+
+One CSV file is written per **node label set** (`out/nodes/`) and per
+**relationship type** (`out/relationships/`), since each has its own property
+schema; node files carry a `:ID`/`:LABEL` header, relationship files a
+`:START_ID`/`:END_ID` header, and property columns are typed
+(`prop:long`/`:double`/`:boolean`/`:string[]`, or untyped for `string`,
+inferred from the first non-null value seen for that column). This is a bulk
+loader for an **empty** database, not an incremental import — unlike Cypher
+mode, it can't add to an existing graph.
+
+Both formats are implemented against the same `IGraphWriter` interface
+(`GraphWriters.cs`): `CypherStreamWriter` prints each file's statements as
+they're built, while `Neo4jAdminImportWriter` buffers nodes/relationships
+across the whole run (needed to group same-schema rows into one file each)
+and writes everything out in `Finish()`.
 
 ---
 
@@ -55,7 +96,10 @@ to process every `.cs` file in it.
 edges. Comments and preprocessor directives are `SyntaxTrivia`; they become
 `CSharpTrivia` nodes linked with `HAS_TRIVIA`.
 
-Node ids are `n1`, `n2`, … The generic labels `CSharpDeclaration`,
+Node ids are `n1`, `n2`, … for the whole run, even across multiple input
+files (required for CSV mode's `:ID` column to be globally unique; it also
+means relationship `MATCH`es in Cypher mode can't accidentally hit an
+unrelated node from another file). The generic labels `CSharpDeclaration`,
 `CSharpStatement` and `CSharpExpression` are added so
 `MATCH (s:CSharpStatement)` matches any statement kind.
 
@@ -181,8 +225,9 @@ C# function scopes use the resolved symbol (e.g. `SampleApp.Models.Dog.Fly()`).
   ORDER BY r.ordinal`. Lists where order isn't meaningful (attributes, using
   directives, accessors) don't have one.
 * **Idempotency**: the tool emits plain `CREATE` statements with unique,
-  per-run ids (`n1`, `n2`, …). Re-importing duplicates the graph; clear the
-  database first or use `MATCH (n) DETACH DELETE n` between runs.
+  run-global ids (`n1`, `n2`, …). Re-importing duplicates the graph; clear the
+  database first or use `MATCH (n) DETACH DELETE n` between runs. CSV mode
+  loads into an empty database anyway, so this only applies to Cypher mode.
 * **Performance**: relationship statements `MATCH` both endpoints by their
   `id` property before `CREATE`ing the edge, rather than referencing the
   `CREATE`-time variable name — each statement is its own autocommitted query

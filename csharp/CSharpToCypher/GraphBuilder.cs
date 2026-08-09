@@ -33,11 +33,15 @@ public sealed class GraphBuilder
         parameterOptions: SymbolDisplayParameterOptions.IncludeType,
         miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes | SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers);
 
-    public GraphBuilder(string file, SemanticModel? model = null)
+    public GraphBuilder(string file, SemanticModel? model = null, int startId = 0)
     {
         _file = file;
         _model = model;
+        _counter = startId;
     }
+
+    /// <summary>The id counter after the last <see cref="Build"/> call, so the next file in a multi-file run can continue it and keep node ids unique across the whole run.</summary>
+    public int Counter => _counter;
 
     public CypherDocument Build(CompilationUnitSyntax root)
     {

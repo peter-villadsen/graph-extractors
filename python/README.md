@@ -18,6 +18,12 @@ standard-library AST, and emits a graph representation of the code as
 * `--souffle` — emit a **Souffle datalog** program for the control-flow graphs
   on **stdout** instead of Cypher, see [Souffle datalog](#souffle-datalog)
   below;
+* `--format cypher|csv` — output format, see [Output formats](#output-formats)
+  below (default `cypher`);
+* `--output-dir DIR` — directory for the CSV files (`--format csv` only,
+  default `neo4j-import`);
+* `--database NAME` — database name for the generated import command
+  (`--format csv` only, default `neo4j`);
 * `--help` / `-h` — usage help.
 
 **stdout carries only one format** so it can be piped straight into a consumer
@@ -92,6 +98,43 @@ MATCH (b:PythonBasicBlock {scope: 'greet.greet'})-[:CONTAINS]->(s:PythonStatemen
 RETURN b.blockId, labels(s) AS statement, s.startLine AS line
 ORDER BY b.blockId;
 ```
+
+---
+
+## Output formats
+
+`--format cypher` (default) streams `CREATE`/`MATCH` statements to stdout, as
+above — each one is its own autocommitted transaction, which doesn't scale to
+a large codebase (many small transactions, or one huge one if you batch it
+yourself).
+
+`--format csv` instead writes
+[`neo4j-admin database import`](https://neo4j.com/docs/operations-manual/current/import/)
+CSV files under `--output-dir`, and prints the ready-to-run import command on
+stdout instead of graph data:
+
+```bash
+python -m cypher_extractor --format csv --output-dir out python/samples/sample.py
+# neo4j-admin database import full --multiline-fields=true --nodes=out/nodes/PythonClassDefinition_PythonStatement.csv --nodes=... --relationships=CONTAINS=out/relationships/CONTAINS.csv --relationships=... neo4j
+
+# stop the target dbms first, then run the printed command (an example):
+neo4j-admin database import full --multiline-fields=true --nodes=out/nodes/PythonClassDefinition_PythonStatement.csv --relationships=CONTAINS=out/relationships/CONTAINS.csv neo4j
+```
+
+One CSV file is written per **node label set** (`out/nodes/`) and per
+**relationship type** (`out/relationships/`), since each has its own property
+schema; node files carry a `:ID`/`:LABEL` header, relationship files a
+`:START_ID`/`:END_ID` header, and property columns are typed
+(`prop:long`/`:double`/`:boolean`/`:string[]`, or untyped for `string`,
+inferred from the first non-null value seen for that column). This is a bulk
+loader for an **empty** database, not an incremental import — unlike Cypher
+mode, it can't add to an existing graph.
+
+Both formats are implemented against the same writer interface
+(`cypher_extractor/writers.py`): `CypherStreamWriter` prints each file's
+statements as they're built, while `Neo4jAdminImportWriter` buffers
+nodes/relationships across the whole run (needed to group same-schema rows
+into one file each) and writes everything out in `finish()`.
 
 ---
 

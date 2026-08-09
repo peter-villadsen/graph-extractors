@@ -11,25 +11,68 @@ internal static class Program
         var verbose = false;
         var printAst = false;
         var emitSouffle = false;
+        var format = "cypher";
+        var outputDir = "neo4j-import";
+        var database = "neo4j";
         var paths = new List<string>();
 
-        foreach (var arg in args)
+        for (var i = 0; i < args.Length; i++)
         {
+            var arg = args[i];
             switch (arg)
             {
                 case "--verbose" or "-v": verbose = true; break;
                 case "--ast" or "-a": printAst = true; break;
                 case "--souffle": emitSouffle = true; break;
+                case "--format":
+                    if (++i >= args.Length)
+                    {
+                        Console.Error.WriteLine("error: --format requires a value");
+                        return 2;
+                    }
+                    format = args[i];
+                    break;
+                case "--output-dir":
+                    if (++i >= args.Length)
+                    {
+                        Console.Error.WriteLine("error: --output-dir requires a value");
+                        return 2;
+                    }
+                    outputDir = args[i];
+                    break;
+                case "--database":
+                    if (++i >= args.Length)
+                    {
+                        Console.Error.WriteLine("error: --database requires a value");
+                        return 2;
+                    }
+                    database = args[i];
+                    break;
                 case "--help" or "-h":
                     PrintHelp();
                     return 0;
                 default:
-                    if (arg.StartsWith("-"))
+                    if (arg.StartsWith("--format="))
+                    {
+                        format = arg["--format=".Length..];
+                    }
+                    else if (arg.StartsWith("--output-dir="))
+                    {
+                        outputDir = arg["--output-dir=".Length..];
+                    }
+                    else if (arg.StartsWith("--database="))
+                    {
+                        database = arg["--database=".Length..];
+                    }
+                    else if (arg.StartsWith("-"))
                     {
                         Console.Error.WriteLine($"error: unknown option: {arg}");
                         return 2;
                     }
-                    paths.Add(arg);
+                    else
+                    {
+                        paths.Add(arg);
+                    }
                     break;
             }
         }
@@ -37,6 +80,12 @@ internal static class Program
         if (paths.Count == 0)
         {
             PrintHelp();
+            return 2;
+        }
+
+        if (format is not ("cypher" or "csv"))
+        {
+            Console.Error.WriteLine($"error: unknown --format: {format} (expected 'cypher' or 'csv')");
             return 2;
         }
 
@@ -90,12 +139,17 @@ internal static class Program
         var compilation = CSharpCompilation.Create("Extraction", trees.Select(t => t.Tree), CoreReferences());
 
         var souffle = new SouffleWriter();
+        IGraphWriter writer = format == "csv"
+            ? new Neo4jAdminImportWriter(outputDir, database, Console.Out)
+            : new CypherStreamWriter(Console.Out);
+        var nextId = 0;
         foreach (var (file, tree) in trees)
         {
             var root = (CompilationUnitSyntax)tree.GetRoot();
             var model = compilation.GetSemanticModel(tree);
-            var builder = new GraphBuilder(file, model);
+            var builder = new GraphBuilder(file, model, nextId);
             var document = builder.Build(root);
+            nextId = builder.Counter;
 
             if (verbose)
             {
@@ -108,19 +162,16 @@ internal static class Program
                 continue;
             }
 
-            foreach (var node in document.Nodes)
-            {
-                Console.WriteLine(node.ToCypher());
-            }
-            foreach (var relationship in document.Relationships)
-            {
-                Console.WriteLine(relationship.ToCypher());
-            }
+            writer.Write(document);
         }
 
         if (emitSouffle)
         {
             Console.Write(souffle.Render());
+        }
+        else
+        {
+            writer.Finish();
         }
 
         return 0;
@@ -166,16 +217,29 @@ internal static class Program
     {
         Console.Error.WriteLine(
             """
-            Usage: CSharpToCypher [--verbose] [--ast] [--souffle] <path> [<path> ...]
+            Usage: CSharpToCypher [--verbose] [--ast] [--souffle] [--format cypher|csv]
+                                   [--output-dir DIR] [--database NAME] <path> [<path> ...]
 
               Parse C# source files (or directories, searched recursively) with
-              Roslyn and emit a Cypher graph (Neo4j) representation on stdout.
+              Roslyn and emit a graph (Neo4j) representation of the code.
 
-              --verbose, -v   print progress information to stderr
-              --ast, -a       print the parsed syntax tree to stderr first
-              --souffle       emit a Souffle datalog program for the control-flow
-                              graphs on stdout instead of Cypher
-              --help, -h      show this help
+              --verbose, -v      print progress information to stderr
+              --ast, -a          print the parsed syntax tree to stderr first
+              --souffle          emit a Souffle datalog program for the control-flow
+                                  graphs on stdout instead of a graph
+              --format FORMAT    'cypher' (default): stream CREATE/MATCH statements to
+                                  stdout, one autocommitted transaction per statement.
+                                  'csv': write neo4j-admin bulk-import CSV files under
+                                  --output-dir (one per node label set / relationship
+                                  type) and print the ready-to-run 'neo4j-admin
+                                  database import' command to stdout — loads a large
+                                  codebase into an empty database in seconds instead of
+                                  many small (or one huge) transactions
+              --output-dir DIR   directory for the CSV files (--format csv only,
+                                  default: neo4j-import)
+              --database NAME    database name for the generated import command
+                                  (--format csv only, default: neo4j)
+              --help, -h         show this help
             """);
     }
 }

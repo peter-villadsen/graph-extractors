@@ -1,15 +1,19 @@
 """Tests for the Python -> Cypher extractor (stdlib unittest)."""
 
 import ast
+import csv
+import io
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cypher_extractor.ast_graph import GraphBuilder
-from cypher_extractor.cypher import escape_string, format_value
+from cypher_extractor.cypher import Node, Relationship, escape_string, format_value
 from cypher_extractor.souffle import SouffleProgram
+from cypher_extractor.writers import CypherStreamWriter, Neo4jAdminImportWriter
 
 
 def build(source, filename="test.py"):
@@ -561,6 +565,99 @@ class SouffleTests(unittest.TestCase):
         text = program.render()
         self.assertIn('basic_block("b1", "mod.f", 0, 1, 0).', text)
         self.assertIn('basic_block("b2", "mod.f", 0, 1, 0).', text)
+
+
+class CypherStreamWriterTests(unittest.TestCase):
+    def test_write_prints_nodes_then_relationships(self):
+        output = io.StringIO()
+        writer = CypherStreamWriter(output)
+        nodes = [Node("p1", "PythonModule", {"name": "m.py"})]
+        relationships = [Relationship("p1", "CONTAINS", "p2")]
+        writer.write(nodes, relationships)
+        writer.finish()
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[0], nodes[0].to_cypher())
+        self.assertEqual(lines[1], relationships[0].to_cypher())
+
+
+class Neo4jAdminImportWriterTests(unittest.TestCase):
+    def _run(self, nodes, relationships):
+        with tempfile.TemporaryDirectory() as output_dir:
+            command_output = io.StringIO()
+            writer = Neo4jAdminImportWriter(output_dir, "neo4j", command_output)
+            writer.write(nodes, relationships)
+            writer.finish()
+
+            def read_csv(path):
+                with open(path, newline="", encoding="utf-8") as handle:
+                    return list(csv.reader(handle))
+
+            files = {}
+            for root, _dirs, names in os.walk(output_dir):
+                for name in names:
+                    files[name] = read_csv(os.path.join(root, name))
+            return files, command_output.getvalue()
+
+    def test_nodes_grouped_by_label_set_with_typed_columns(self):
+        nodes = [
+            Node("p1", ["PythonFunctionDefinition", "PythonStatement"], {"name": "f", "isAsync": False}),
+            Node("p2", ["PythonFunctionDefinition", "PythonStatement"], {"name": "g", "isAsync": True}),
+            Node("p3", "PythonModule", {"name": "m.py"}),
+        ]
+        files, command = self._run(nodes, [])
+
+        self.assertIn("PythonFunctionDefinition_PythonStatement.csv", files)
+        rows = files["PythonFunctionDefinition_PythonStatement.csv"]
+        self.assertEqual(rows[0], [":ID", ":LABEL", "name", "isAsync:boolean"])
+        self.assertEqual(rows[1], ["p1", "PythonFunctionDefinition;PythonStatement", "f", "false"])
+        self.assertEqual(rows[2], ["p2", "PythonFunctionDefinition;PythonStatement", "g", "true"])
+
+        self.assertIn("PythonModule.csv", files)
+        self.assertEqual(files["PythonModule.csv"][1], ["p3", "PythonModule", "m.py"])
+
+        self.assertIn("--nodes=", command)
+        self.assertIn("neo4j-admin database import full", command)
+        self.assertTrue(command.rstrip().endswith("neo4j"))
+
+    def test_missing_property_renders_as_empty_field(self):
+        nodes = [
+            Node("p1", "PythonConstant", {"value": 1, "kind": "u"}),
+            Node("p2", "PythonConstant", {"value": 2}),
+        ]
+        files, _ = self._run(nodes, [])
+        rows = files["PythonConstant.csv"]
+        self.assertEqual(rows[0], [":ID", ":LABEL", "value:long", "kind"])
+        self.assertEqual(rows[2], ["p2", "PythonConstant", "2", ""])
+
+    def test_relationships_grouped_by_type_with_start_end_columns(self):
+        relationships = [
+            Relationship("p1", "CONTAINS", "p2", {"ordinal": 0}),
+            Relationship("p1", "CONTAINS", "p3", {"ordinal": 1}),
+            Relationship("p1", "RETURNS", "p4"),
+        ]
+        files, command = self._run([], relationships)
+
+        rows = files["CONTAINS.csv"]
+        self.assertEqual(rows[0], [":START_ID", ":END_ID", "ordinal:long"])
+        self.assertEqual(rows[1], ["p1", "p2", "0"])
+        self.assertEqual(rows[2], ["p1", "p3", "1"])
+
+        self.assertEqual(files["RETURNS.csv"][0], [":START_ID", ":END_ID"])
+        self.assertIn("--relationships=CONTAINS=", command)
+        self.assertIn("--relationships=RETURNS=", command)
+
+    def test_commas_quotes_and_newlines_round_trip(self):
+        nodes = [Node("p1", "PythonConstant", {"value": 'a,b"c\nd'})]
+        files, _ = self._run(nodes, [])
+        rows = files["PythonConstant.csv"]
+        self.assertEqual(rows[1][2], 'a,b"c\nd')
+
+    def test_array_property_uses_semicolon_delimiter_and_type_suffix(self):
+        nodes = [Node("p1", "PythonFunctionDefinition", {"typeParameters": ["T", "U"]})]
+        files, _ = self._run(nodes, [])
+        rows = files["PythonFunctionDefinition.csv"]
+        self.assertEqual(rows[0], [":ID", ":LABEL", "typeParameters:string[]"])
+        self.assertEqual(rows[1], ["p1", "PythonFunctionDefinition", "T;U"])
 
 
 if __name__ == "__main__":

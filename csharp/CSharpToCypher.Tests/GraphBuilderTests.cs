@@ -642,3 +642,208 @@ public class SouffleWriterTests
         Assert.Contains("\"D.N()\"", text);
     }
 }
+
+public class CypherStreamWriterTests
+{
+    [Fact]
+    public void Write_prints_nodes_then_relationships()
+    {
+        var output = new StringWriter();
+        var writer = new CypherStreamWriter(output);
+        var document = new CypherDocument();
+        var node = new CypherNode { Id = "n1", Labels = new[] { "CSharpCompilationUnit" } };
+        node.Properties["name"] = "m.cs";
+        document.Nodes.Add(node);
+        document.Relationships.Add(new CypherRelationship { Source = "n1", Type = "CONTAINS", Target = "n2" });
+
+        writer.Write(document);
+        writer.Finish();
+
+        var lines = output.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(node.ToCypher(), lines[0]);
+        Assert.Equal(document.Relationships[0].ToCypher(), lines[1]);
+    }
+}
+
+public class Neo4jAdminImportWriterTests : IDisposable
+{
+    private readonly string _outputDir = Path.Combine(Path.GetTempPath(), "graph-extractors-tests-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_outputDir))
+        {
+            Directory.Delete(_outputDir, recursive: true);
+        }
+    }
+
+    private (Dictionary<string, List<string[]>> Files, string Command) Run(CypherDocument document)
+    {
+        var commandOutput = new StringWriter();
+        var writer = new Neo4jAdminImportWriter(_outputDir, "neo4j", commandOutput);
+        writer.Write(document);
+        writer.Finish();
+
+        var files = Directory.EnumerateFiles(_outputDir, "*.csv", SearchOption.AllDirectories)
+            .ToDictionary(f => Path.GetFileName(f)!, ReadCsv);
+        return (files, commandOutput.ToString());
+    }
+
+    // Minimal RFC4180 reader operating on the whole file (not line-by-line, so a
+    // quoted field's embedded newline doesn't get mistaken for a row boundary).
+    private static List<string[]> ReadCsv(string path)
+    {
+        var text = File.ReadAllText(path);
+        var rows = new List<string[]>();
+        var fields = new List<string>();
+        var current = new System.Text.StringBuilder();
+        var inQuotes = false;
+        var i = 0;
+        while (i < text.Length)
+        {
+            var ch = text[i];
+            if (inQuotes)
+            {
+                if (ch == '"' && i + 1 < text.Length && text[i + 1] == '"')
+                {
+                    current.Append('"');
+                    i += 2;
+                    continue;
+                }
+                if (ch == '"')
+                {
+                    inQuotes = false;
+                    i++;
+                    continue;
+                }
+                current.Append(ch);
+                i++;
+                continue;
+            }
+            switch (ch)
+            {
+                case '"':
+                    inQuotes = true;
+                    i++;
+                    continue;
+                case ',':
+                    fields.Add(current.ToString());
+                    current.Clear();
+                    i++;
+                    continue;
+                case '\r':
+                    i++;
+                    continue;
+                case '\n':
+                    fields.Add(current.ToString());
+                    current.Clear();
+                    rows.Add(fields.ToArray());
+                    fields = new List<string>();
+                    i++;
+                    continue;
+                default:
+                    current.Append(ch);
+                    i++;
+                    continue;
+            }
+        }
+        if (current.Length > 0 || fields.Count > 0)
+        {
+            fields.Add(current.ToString());
+            rows.Add(fields.ToArray());
+        }
+        return rows;
+    }
+
+    private static CypherNode MakeNode(string id, IReadOnlyList<string> labels, Dictionary<string, object?> properties)
+    {
+        var node = new CypherNode { Id = id, Labels = labels };
+        foreach (var (key, value) in properties)
+        {
+            node.Properties[key] = value;
+        }
+        return node;
+    }
+
+    [Fact]
+    public void Nodes_grouped_by_label_set_with_typed_columns()
+    {
+        var document = new CypherDocument();
+        document.Nodes.Add(MakeNode("n1", new[] { "CSharpMethodDeclaration", "CSharpDeclaration" }, new() { ["name"] = "F", ["isAsync"] = false }));
+        document.Nodes.Add(MakeNode("n2", new[] { "CSharpMethodDeclaration", "CSharpDeclaration" }, new() { ["name"] = "G", ["isAsync"] = true }));
+        document.Nodes.Add(MakeNode("n3", new[] { "CSharpCompilationUnit" }, new() { ["name"] = "m.cs" }));
+
+        var (files, command) = Run(document);
+
+        Assert.True(files.ContainsKey("CSharpMethodDeclaration_CSharpDeclaration.csv"));
+        var rows = files["CSharpMethodDeclaration_CSharpDeclaration.csv"];
+        Assert.Equal(new[] { ":ID", ":LABEL", "name", "isAsync:boolean" }, rows[0]);
+        Assert.Equal(new[] { "n1", "CSharpMethodDeclaration;CSharpDeclaration", "F", "false" }, rows[1]);
+        Assert.Equal(new[] { "n2", "CSharpMethodDeclaration;CSharpDeclaration", "G", "true" }, rows[2]);
+
+        Assert.True(files.ContainsKey("CSharpCompilationUnit.csv"));
+        Assert.Equal(new[] { "n3", "CSharpCompilationUnit", "m.cs" }, files["CSharpCompilationUnit.csv"][1]);
+
+        Assert.Contains("--nodes=", command);
+        Assert.Contains("neo4j-admin database import full", command);
+        Assert.EndsWith(" neo4j", command.TrimEnd());
+    }
+
+    [Fact]
+    public void Missing_property_renders_as_empty_field()
+    {
+        var document = new CypherDocument();
+        document.Nodes.Add(MakeNode("n1", new[] { "CSharpType" }, new() { ["name"] = "int", ["kind"] = "class" }));
+        document.Nodes.Add(MakeNode("n2", new[] { "CSharpType" }, new() { ["name"] = "string" }));
+
+        var (files, _) = Run(document);
+
+        var rows = files["CSharpType.csv"];
+        Assert.Equal(new[] { ":ID", ":LABEL", "name", "kind" }, rows[0]);
+        Assert.Equal(new[] { "n2", "CSharpType", "string", "" }, rows[2]);
+    }
+
+    [Fact]
+    public void Relationships_grouped_by_type_with_start_end_columns()
+    {
+        var document = new CypherDocument();
+        document.Relationships.Add(new CypherRelationship { Source = "n1", Type = "CONTAINS", Target = "n2", Properties = new() { ["ordinal"] = 0 } });
+        document.Relationships.Add(new CypherRelationship { Source = "n1", Type = "CONTAINS", Target = "n3", Properties = new() { ["ordinal"] = 1 } });
+        document.Relationships.Add(new CypherRelationship { Source = "n1", Type = "RETURNS", Target = "n4" });
+
+        var (files, command) = Run(document);
+
+        var rows = files["CONTAINS.csv"];
+        Assert.Equal(new[] { ":START_ID", ":END_ID", "ordinal:long" }, rows[0]);
+        Assert.Equal(new[] { "n1", "n2", "0" }, rows[1]);
+        Assert.Equal(new[] { "n1", "n3", "1" }, rows[2]);
+
+        Assert.Equal(new[] { ":START_ID", ":END_ID" }, files["RETURNS.csv"][0]);
+        Assert.Contains("--relationships=CONTAINS=", command);
+        Assert.Contains("--relationships=RETURNS=", command);
+    }
+
+    [Fact]
+    public void Commas_quotes_and_newlines_round_trip()
+    {
+        var document = new CypherDocument();
+        document.Nodes.Add(MakeNode("n1", new[] { "CSharpAttribute" }, new() { ["text"] = "a,b\"c\nd" }));
+
+        var (files, _) = Run(document);
+
+        Assert.Equal("a,b\"c\nd", files["CSharpAttribute.csv"][1][2]);
+    }
+
+    [Fact]
+    public void Array_property_uses_semicolon_delimiter_and_type_suffix()
+    {
+        var document = new CypherDocument();
+        document.Nodes.Add(MakeNode("n1", new[] { "CSharpClassDeclaration" }, new() { ["typeParameters"] = new object?[] { "T", "U" } }));
+
+        var (files, _) = Run(document);
+
+        var rows = files["CSharpClassDeclaration.csv"];
+        Assert.Equal(new[] { ":ID", ":LABEL", "typeParameters:string[]" }, rows[0]);
+        Assert.Equal(new[] { "n1", "CSharpClassDeclaration", "T;U" }, rows[1]);
+    }
+}
