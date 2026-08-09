@@ -65,15 +65,19 @@ Node ids are `n1`, `n2`, … The generic labels `CSharpDeclaration`,
 | ----- | ---------------- |
 | `CSharpCompilationUnit` | the parsed file |
 | `CSharpNamespaceDeclaration` | namespace |
-| `CSharpUsingDirective` | using / using static / using-alias |
+| `CSharpUsingDirective`, `CSharpExternAliasDirective` | using / using static / using-alias, `extern alias` |
 | `CSharpClassDeclaration`, `CSharpRecordDeclaration`, `CSharpRecordStructDeclaration`, `CSharpStructDeclaration`, `CSharpInterfaceDeclaration`, `CSharpEnumDeclaration` | `class_declaration`, `record_declaration`, … |
-| `CSharpMethodDeclaration`, `CSharpConstructorDeclaration`, `CSharpDestructorDeclaration`, `CSharpPropertyDeclaration`, `CSharpIndexerDeclaration`, `CSharpFieldDeclaration`, `CSharpEventDeclaration`, `CSharpDelegateDeclaration`, `CSharpEnumMember` | member declarations |
+| `CSharpMethodDeclaration`, `CSharpConstructorDeclaration`, `CSharpDestructorDeclaration`, `CSharpOperatorDeclaration`, `CSharpConversionOperatorDeclaration`, `CSharpPropertyDeclaration`, `CSharpIndexerDeclaration`, `CSharpFieldDeclaration`, `CSharpEventDeclaration`, `CSharpDelegateDeclaration`, `CSharpEnumMember` | member declarations, including operator/conversion-operator overloads |
 | `CSharpParameter`, `CSharpTypeParameter`, `CSharpVariableDeclarator` | parameters and variables |
-| `CSharpType` | referenced type names (base class, interfaces, parameter/variable/return types) |
+| `CSharpType` | referenced type names (base class, interfaces, parameter/variable/return types, constraint types) |
+| `CSharpConstraint` | a non-type `where T : ...` constraint (`class`/`struct`, `new()`, `default`); a type constraint links straight to a `CSharpType` instead |
+| `CSharpAttribute`, `CSharpAttributeArgument` | `[Attr(arg, Name = value)]`, on any declaration, parameter or type parameter, including assembly/module/return targets |
 | `CSharpBlock` | a statement block (`block`) |
 | `CSharpIfStatement`, `CSharpWhileStatement`, `CSharpDoStatement`, `CSharpForStatement`, `CSharpForEachStatement`, `CSharpReturnStatement`, `CSharpThrowStatement`, `CSharpSwitchStatement`, `CSharpTryStatement`, `CSharpUsingStatement`, `CSharpLockStatement`, `CSharpLocalDeclarationStatement`, `CSharpExpressionStatement`, `CSharpYieldStatement`, `CSharpBreakStatement`, `CSharpContinueStatement`, `CSharpGotoStatement` | the corresponding statement productions |
-| `CSharpCatchClause`, `CSharpSwitchSection`, `CSharpCaseLabel` | try/catch and switch parts |
-| `CSharpExpression`, `CSharpBinaryExpression`, `CSharpInvocationExpression`, `CSharpMemberAccessExpression`, `CSharpLiteralExpression`, `CSharpIdentifierName`, `CSharpGenericName`, `CSharpObjectCreationExpression`, `CSharpAssignmentExpression`, `CSharpConditionalExpression`, `CSharpLambdaExpression`, … | expressions |
+| `CSharpCatchClause`, `CSharpSwitchSection`, `CSharpCaseLabel` | try/catch and switch-statement parts |
+| `CSharpExpression`, `CSharpBinaryExpression`, `CSharpInvocationExpression`, `CSharpMemberAccessExpression`, `CSharpLiteralExpression`, `CSharpIdentifierName`, `CSharpGenericName`, `CSharpObjectCreationExpression`, `CSharpAssignmentExpression`, `CSharpConditionalExpression`, `CSharpLambdaExpression`, `CSharpAnonymousMethodExpression` | expressions, including `delegate(...) { }` |
+| `CSharpSwitchExpression`, `CSharpSwitchExpressionArm` | `x switch { pattern => expr, ... }` and each arm |
+| `CSharpQueryExpression`, `CSharpQueryClause`, `CSharpOrdering`, `CSharpQueryContinuation` | LINQ query syntax (`from`/`let`/`where`/`join`/`orderby`/`select`/`group`/`into`) |
 | `CSharpTrivia` | comments and preprocessing directives |
 
 ## Relationships (a selection)
@@ -82,7 +86,11 @@ Node ids are `n1`, `n2`, … The generic labels `CSharpDeclaration`,
 (:CSharpClassDeclaration)-[:DERIVED_FROM]->(:CSharpType)       -- base class
 (:CSharpClassDeclaration)-[:IMPLEMENTS]->(:CSharpType)         -- interface
 (:CSharpClassDeclaration)-[:DECLARES]->(:CSharpMethodDeclaration)
-(:CSharpMethodDeclaration)-[:HAS_PARAMETER]->(:CSharpParameter)
+(:CSharpClassDeclaration)-[:HAS_CONSTRAINT]->(:CSharpType)     -- where T : IComparable<T>
+(:CSharpClassDeclaration)-[:HAS_CONSTRAINT]->(:CSharpConstraint) -- where T : new()
+(:CSharpMethodDeclaration)-[:HAS_ATTRIBUTE]->(:CSharpAttribute)
+(:CSharpAttribute)-[:HAS_ARGUMENT]->(:CSharpAttributeArgument)
+(:CSharpMethodDeclaration)-[:HAS_PARAMETER {ordinal: 0}]->(:CSharpParameter) -- positional order, see Notes
 (:CSharpParameter)-[:OF_TYPE]->(:CSharpType)
 (:CSharpMethodDeclaration)-[:RETURNS]->(:CSharpType)
 (:CSharpMethodDeclaration)-[:HAS_BODY]->(:CSharpBlock)
@@ -95,6 +103,9 @@ Node ids are `n1`, `n2`, … The generic labels `CSharpDeclaration`,
 (:CSharpForStatement)-[:HAS_CONDITION]->(:CSharpExpression)    -- for_condition
 (:CSharpForStatement)-[:HAS_INCREMENTOR]->(:CSharpExpression)
 (:CSharpSwitchStatement)-[:HAS_CASE]->(:CSharpSwitchSection)
+(:CSharpSwitchExpression)-[:HAS_ARM]->(:CSharpSwitchExpressionArm)
+(:CSharpQueryExpression)-[:HAS_CLAUSE]->(:CSharpQueryClause)
+(:CSharpQueryClause)-[:HAS_ORDERING]->(:CSharpOrdering)        -- orderby clause
 (:CSharpTryStatement)-[:HAS_CATCH]->(:CSharpCatchClause)
 (:CSharpNode)-[:HAS_TRIVIA]->(:CSharpTrivia)
 ```
@@ -103,11 +114,17 @@ Node ids are `n1`, `n2`, … The generic labels `CSharpDeclaration`,
 
 ## Control flow graphs
 
-The extractor models the **control flow graph** of every method, always
-emitted, using Roslyn's
+The extractor models the **control flow graph** of every executable body,
+always emitted, using Roslyn's
 [`ControlFlowGraph`](https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.flowanalysis.controlflowgraph)
 (`ControlFlowGraph.Create(declaration, model, …)`), the same analyzer that
-powers Roslyn code-fixers and analyzers.
+powers Roslyn code-fixers and analyzers. This covers methods, constructors,
+destructors, operator and conversion-operator overloads, accessors, local
+functions, lambdas, and `delegate(...) { }` anonymous methods. Expression-
+bodied properties and indexers (`int X => expr;`) get one too — Roslyn's CFG
+API doesn't accept the property/indexer declaration itself for that shape, so
+the extractor passes its `ArrowExpressionClauseSyntax` instead, and resolves
+`scope` from the enclosing property/indexer symbol.
 
 Each basic block becomes a `CSharpBasicBlock` node with `ordinal`,
 `isEntry`/`isReachable`/`isFinal`, `scope` (the enclosing method), and source
@@ -152,6 +169,17 @@ C# function scopes use the resolved symbol (e.g. `SampleApp.Models.Dog.Fly()`).
 
 ## Notes
 
+* **Order**: statements in a block are chained with `FOLLOWS` in source order,
+  but sibling sub-expressions and declaration lists are not implicitly
+  ordered by Cypher — same-typed relationships from one node don't preserve
+  retrieval order on their own. Wherever order is semantically meaningful
+  (binary-operand order, call/attribute arguments, generic type arguments,
+  parameter lists, `catch`/`switch`/switch-expression-arm order, LINQ clause
+  pipeline order, and which statement runs first inside one CFG basic block),
+  the relationship carries an integer `ordinal` property instead of relying
+  on the endpoints' `startOffset`: `MATCH (n)-[r:HAS_ARGUMENT]->(a) RETURN a
+  ORDER BY r.ordinal`. Lists where order isn't meaningful (attributes, using
+  directives, accessors) don't have one.
 * **Idempotency**: the tool emits plain `CREATE` statements with unique,
   per-run ids (`n1`, `n2`, …). Re-importing duplicates the graph; clear the
   database first or use `MATCH (n) DETACH DELETE n` between runs.
@@ -169,7 +197,11 @@ C# function scopes use the resolved symbol (e.g. `SampleApp.Models.Dog.Fly()`).
   is filtered out; only comments and preprocessor directives are emitted.
 * **Expressions** are deliberately shallow "for now": operators are stored as
   properties and operands linked with `HAS_OPERAND`; sub-expression detail can
-  be deepened later without changing the overall shape.
+  be deepened later without changing the overall shape. **Patterns** (`is Foo
+  f`, `case Dog { Age: > 1 }`, switch-expression arm patterns) follow the same
+  policy: the pattern is stored as a flattened `pattern`/`text` string property
+  rather than walked into `CSharpConstantPattern`/`CSharpRecursivePattern`/…
+  nodes.
 * **Troubleshooting**: re-running an import duplicates the graph — clear it
   first with `cypher-shell "MATCH (n) DETACH DELETE n;"` (or
   `cypher-shell --database neo4j "MATCH (n) DETACH DELETE n;"` if you target a

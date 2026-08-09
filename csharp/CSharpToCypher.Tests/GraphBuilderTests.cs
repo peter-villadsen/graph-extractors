@@ -350,6 +350,214 @@ public class GraphBuilderTests
             r.Type == "CONTAINS" && blocks.Any(b => b.Id == r.Source)).ToList();
         Assert.True(linked.Count > 0);
     }
+
+    [Fact]
+    public void Class_attribute_is_captured()
+    {
+        var doc = Build("[System.Serializable] class C { }");
+        var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
+        var attr = doc.Nodes.First(n => n.Labels.Contains("CSharpAttribute"));
+        Assert.Equal("System.Serializable", attr.Properties["name"]);
+        Assert.Contains(doc.Relationships, r => r.Source == cls.Id && r.Type == "HAS_ATTRIBUTE" && r.Target == attr.Id);
+    }
+
+    [Fact]
+    public void Attribute_target_and_named_argument_are_captured()
+    {
+        var doc = Build("class C { [return: My(Value = 1)] int M() => 1; }");
+        var attr = doc.Nodes.First(n => n.Labels.Contains("CSharpAttribute"));
+        Assert.Equal("return", attr.Properties["target"]);
+        var arg = doc.Nodes.First(n => n.Labels.Contains("CSharpAttributeArgument"));
+        Assert.Equal("Value", arg.Properties["name"]);
+        Assert.Contains(doc.Relationships, r => r.Source == attr.Id && r.Type == "HAS_ARGUMENT" && r.Target == arg.Id);
+    }
+
+    [Fact]
+    public void Parameter_attribute_is_captured()
+    {
+        var doc = Build("class C { void M([My] int x) { } }");
+        var param = doc.Nodes.First(n => n.Labels.Contains("CSharpParameter"));
+        Assert.Contains(doc.Relationships, r => r.Source == param.Id && r.Type == "HAS_ATTRIBUTE");
+    }
+
+    [Fact]
+    public void Operator_overload_is_captured_with_cfg()
+    {
+        var doc = BuildWithModel("class Vec { public static Vec operator +(Vec a, Vec b) { if (a == null) { return b; } return a; } }");
+        var op = doc.Nodes.First(n => n.Labels.Contains("CSharpOperatorDeclaration"));
+        Assert.Equal("+", op.Properties["operator"]);
+        Assert.Contains(doc.Relationships, r => r.Source == op.Id && r.Type == "RETURNS");
+        Assert.Equal(2, doc.Relationships.Count(r => r.Source == op.Id && r.Type == "HAS_PARAMETER"));
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpBasicBlock"));
+    }
+
+    [Fact]
+    public void Conversion_operator_is_captured_with_cfg()
+    {
+        var doc = BuildWithModel("class Meters { public static implicit operator double(Meters m) { return 1.0; } }");
+        var co = doc.Nodes.First(n => n.Labels.Contains("CSharpConversionOperatorDeclaration"));
+        Assert.Equal("implicit", co.Properties["kind"]);
+        Assert.Contains(doc.Relationships, r => r.Source == co.Id && r.Type == "RETURNS");
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpBasicBlock"));
+    }
+
+    [Fact]
+    public void Generic_constraints_are_captured()
+    {
+        var doc = Build("class C<T> where T : System.IDisposable, new() { }");
+        var cls = doc.Nodes.First(n => n.Labels.Contains("CSharpClassDeclaration"));
+        var constraintEdges = doc.Relationships.Where(r => r.Source == cls.Id && r.Type == "HAS_CONSTRAINT").ToList();
+        Assert.Equal(2, constraintEdges.Count);
+        Assert.Contains(constraintEdges, e => e.Properties != null
+            && e.Properties.TryGetValue("typeParameter", out var tp) && (string?)tp == "T");
+        var ctorConstraint = doc.Nodes.First(n => n.Labels.Contains("CSharpConstraint"));
+        Assert.Equal("new()", ctorConstraint.Properties["kind"]);
+    }
+
+    [Fact]
+    public void Switch_expression_and_arms_are_captured()
+    {
+        var doc = Build("class C { int M(int x) => x switch { 0 => 1, _ => 2 }; }");
+        var swe = doc.Nodes.First(n => n.Labels.Contains("CSharpSwitchExpression"));
+        var arms = doc.Nodes.Where(n => n.Labels.Contains("CSharpSwitchExpressionArm")).ToList();
+        Assert.Equal(2, arms.Count);
+        Assert.Equal(2, doc.Relationships.Count(r => r.Source == swe.Id && r.Type == "HAS_ARM"));
+    }
+
+    [Fact]
+    public void Anonymous_method_body_is_walked()
+    {
+        var doc = Build("class C { void M() { System.Action a = delegate() { int y = 1; }; } }");
+        var am = doc.Nodes.First(n => n.Labels.Contains("CSharpAnonymousMethodExpression"));
+        Assert.Contains(doc.Relationships, r => r.Source == am.Id && r.Type == "HAS_BODY");
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpLocalDeclarationStatement"));
+    }
+
+    [Fact]
+    public void Query_expression_clauses_are_captured()
+    {
+        var doc = Build("class C { void M() { var q = from x in xs where x > 0 orderby x select x; } }");
+        var qe = doc.Nodes.First(n => n.Labels.Contains("CSharpQueryExpression"));
+        var kinds = doc.Nodes.Where(n => n.Labels.Contains("CSharpQueryClause"))
+            .Select(n => n.Properties["kind"] as string)
+            .ToList();
+        Assert.Contains("from", kinds);
+        Assert.Contains("where", kinds);
+        Assert.Contains("orderby", kinds);
+        Assert.Contains("select", kinds);
+        Assert.Contains(doc.Relationships, r => r.Source == qe.Id && r.Type == "HAS_CLAUSE");
+    }
+
+    [Fact]
+    public void Lambda_body_gets_cfg_when_it_has_branches()
+    {
+        var doc = BuildWithModel("class C { void M() { System.Func<int, int> f = x => { if (x > 0) { return x; } return -x; }; } }");
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpBasicBlock"));
+    }
+
+    [Fact]
+    public void Expression_bodied_property_attributes_calls_to_itself()
+    {
+        var doc = BuildWithModel("class C { int Compute() => 1; int X => Compute(); }");
+        var prop = doc.Nodes.First(n => n.Labels.Contains("CSharpPropertyDeclaration") && n.Properties["name"] as string == "X");
+        Assert.Contains(doc.Relationships, r => r.Source == prop.Id && r.Type == "CALLS");
+    }
+
+    [Fact]
+    public void Expression_bodied_property_gets_cfg()
+    {
+        var doc = BuildWithModel("class C { int X => 1; }");
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpBasicBlock") && n.Properties["scope"] as string == "C.X");
+    }
+
+    [Fact]
+    public void Expression_bodied_indexer_gets_cfg()
+    {
+        var doc = BuildWithModel("class C { int this[int i] => i; }");
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpBasicBlock"));
+    }
+
+    [Fact]
+    public void Record_positional_parameters_are_captured()
+    {
+        var doc = Build("record Dog(string Name, int Age);");
+        var rec = doc.Nodes.First(n => n.Labels.Contains("CSharpRecordDeclaration"));
+        var paramEdges = doc.Relationships.Where(r => r.Source == rec.Id && r.Type == "HAS_PARAMETER").ToList();
+        Assert.Equal(2, paramEdges.Count);
+    }
+
+    [Fact]
+    public void Namespace_using_directive_is_captured()
+    {
+        var doc = Build("namespace Foo { using System; class C { } }");
+        var ns = doc.Nodes.First(n => n.Labels.Contains("CSharpNamespaceDeclaration"));
+        Assert.Contains(doc.Relationships, r => r.Source == ns.Id && r.Type == "USES");
+    }
+
+    [Fact]
+    public void Extern_alias_directive_is_captured()
+    {
+        var doc = Build("extern alias Foo;\nclass C { }");
+        Assert.Contains(doc.Nodes, n => n.Labels.Contains("CSharpExternAliasDirective") && n.Properties["identifier"] as string == "Foo");
+    }
+
+    [Fact]
+    public void Binary_expression_operands_carry_ordinal()
+    {
+        var doc = Build("class C { void M() { var x = a - b; } }");
+        var bin = doc.Nodes.First(n => n.Labels.Contains("CSharpBinaryExpression"));
+        var operands = doc.Relationships.Where(r => r.Source == bin.Id && r.Type == "HAS_OPERAND")
+            .OrderBy(r => r.Properties!["ordinal"])
+            .ToList();
+        Assert.Equal(2, operands.Count);
+        Assert.Equal(0, operands[0].Properties!["ordinal"]);
+        Assert.Equal(1, operands[1].Properties!["ordinal"]);
+        var left = doc.Nodes.First(n => n.Id == operands[0].Target);
+        var right = doc.Nodes.First(n => n.Id == operands[1].Target);
+        Assert.Equal("a", left.Properties["name"]);
+        Assert.Equal("b", right.Properties["name"]);
+    }
+
+    [Fact]
+    public void Argument_ordinal_matches_call_position()
+    {
+        var doc = Build("class C { void M() { F(x, y, z); } }");
+        var inv = doc.Nodes.First(n => n.Labels.Contains("CSharpInvocationExpression"));
+        var argsByOrdinal = doc.Relationships.Where(r => r.Source == inv.Id && r.Type == "HAS_ARGUMENT")
+            .OrderBy(r => (int)r.Properties!["ordinal"]!)
+            .Select(r => doc.Nodes.First(n => n.Id == r.Target))
+            .ToList();
+        Assert.Equal(3, argsByOrdinal.Count);
+        var names = argsByOrdinal
+            .Select(a => doc.Relationships.First(r => r.Source == a.Id && r.Type == "HAS_EXPRESSION").Target)
+            .Select(id => doc.Nodes.First(n => n.Id == id).Properties["name"] as string)
+            .ToList();
+        Assert.Equal(new[] { "x", "y", "z" }, names);
+    }
+
+    [Fact]
+    public void Parameter_list_carries_ordinal()
+    {
+        var doc = Build("class C { void M(int a, int b, int c) { } }");
+        var method = doc.Nodes.First(n => n.Labels.Contains("CSharpMethodDeclaration"));
+        var ordinals = doc.Relationships.Where(r => r.Source == method.Id && r.Type == "HAS_PARAMETER")
+            .Select(r => (int)r.Properties!["ordinal"]!)
+            .OrderBy(o => o)
+            .ToList();
+        Assert.Equal(new[] { 0, 1, 2 }, ordinals);
+    }
+
+    [Fact]
+    public void Cfg_block_statements_carry_ordinal()
+    {
+        var doc = BuildWithModel("class C { void M() { int a = 1; int b = 2; int c = 3; } }");
+        var block = doc.Nodes.First(n => n.Labels.Contains("CSharpBasicBlock") && n.Properties["kind"] as string == "Block");
+        var ordinals = doc.Relationships.Where(r => r.Source == block.Id && r.Type == "CONTAINS")
+            .Select(r => (int)r.Properties!["ordinal"]!)
+            .OrderBy(o => o)
+            .ToList();
+        Assert.Equal(new[] { 0, 1, 2 }, ordinals);
+    }
 }
 
 public class SouffleWriterTests

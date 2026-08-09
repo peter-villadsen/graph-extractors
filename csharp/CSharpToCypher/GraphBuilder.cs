@@ -139,12 +139,13 @@ public sealed class GraphBuilder
             blockIds[block] = blockId;
 
             var linked = new HashSet<string>();
+            var statementOrdinal = 0;
             foreach (var op in block.Operations)
             {
                 var syntaxId = NodeIdOrNull(op.Syntax);
                 if (syntaxId is not null && linked.Add(syntaxId))
                 {
-                    AddRel(blockId, "CONTAINS", syntaxId);
+                    AddRel(blockId, "CONTAINS", syntaxId, new[] { KV("ordinal", statementOrdinal++) });
                 }
             }
         }
@@ -184,27 +185,35 @@ public sealed class GraphBuilder
     /// </summary>
     private string CfgScope(SyntaxNode declaration)
     {
+        // An expression-bodied property/indexer's CFG is rooted at its
+        // ArrowExpressionClauseSyntax (the only node shape Roslyn's CFG API
+        // recognizes there), but the declared symbol lives one level up.
+        var symbolTarget = declaration is ArrowExpressionClauseSyntax { Parent: { } parent } ? parent : declaration;
         if (_model is not null)
         {
-            var symbol = _model.GetDeclaredSymbol(declaration);
+            var symbol = _model.GetDeclaredSymbol(symbolTarget);
             if (symbol is not null)
             {
                 return symbol.ToDisplayString(QualifiedFormat);
             }
         }
-        return declaration switch
+        return symbolTarget switch
         {
             MethodDeclarationSyntax m => m.Identifier.ValueText,
             ConstructorDeclarationSyntax c => c.Identifier.ValueText,
             DestructorDeclarationSyntax d => d.Identifier.ValueText,
             LocalFunctionStatementSyntax lf => lf.Identifier.ValueText,
+            OperatorDeclarationSyntax op => $"operator {op.OperatorToken.Text}",
+            ConversionOperatorDeclarationSyntax co => $"{co.ImplicitOrExplicitKeyword.Text} operator {co.Type}",
+            PropertyDeclarationSyntax p => p.Identifier.ValueText,
+            IndexerDeclarationSyntax => "this[]",
             AccessorDeclarationSyntax a => a.Parent switch
             {
                 PropertyDeclarationSyntax p => $"{p.Identifier.ValueText}.{a.Keyword.ValueText}",
                 EventDeclarationSyntax e => $"{e.Identifier.ValueText}.{a.Keyword.ValueText}",
                 _ => a.Keyword.ValueText,
             },
-            _ => declaration.Kind().ToString(),
+            _ => symbolTarget.Kind().ToString(),
         };
     }
 
@@ -429,6 +438,112 @@ public sealed class GraphBuilder
         return symbol is null || symbol.TypeKind == TypeKind.Class;
     }
 
+    /// <summary>Attaches every attribute in every attribute list to <paramref name="ownerId"/> via :HAS_ATTRIBUTE.</summary>
+    private void BuildAttributeLists(SyntaxList<AttributeListSyntax> attributeLists, string ownerId)
+    {
+        foreach (var list in attributeLists)
+        {
+            var target = list.Target?.Identifier.ValueText;
+            foreach (var attribute in list.Attributes)
+            {
+                var props = new List<KeyValuePair<string, object?>>
+                {
+                    KV("name", attribute.Name.ToString()),
+                    KV("target", target),
+                    KV("text", attribute.ToString()),
+                };
+                props.AddRange(SymbolProps(attribute));
+                var id = CreateNode(attribute, new[] { "CSharpAttribute" }, props);
+                AddRel(ownerId, "HAS_ATTRIBUTE", id);
+                if (attribute.ArgumentList is not null)
+                {
+                    for (var i = 0; i < attribute.ArgumentList.Arguments.Count; i++)
+                    {
+                        AddRel(id, "HAS_ARGUMENT", BuildNode(attribute.ArgumentList.Arguments[i], null, null), new[] { KV("ordinal", i) });
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>Attaches every `where T : ...` constraint to <paramref name="ownerId"/> via :HAS_CONSTRAINT.</summary>
+    private void BuildConstraintClauses(SyntaxList<TypeParameterConstraintClauseSyntax> clauses, string ownerId)
+    {
+        foreach (var clause in clauses)
+        {
+            var typeParameter = clause.Name.Identifier.ValueText;
+            foreach (var constraint in clause.Constraints)
+            {
+                switch (constraint)
+                {
+                    case TypeConstraintSyntax tc:
+                        AddRel(ownerId, "HAS_CONSTRAINT", AddTypeNode(tc.Type), new[] { KV("typeParameter", (object?)typeParameter) });
+                        break;
+                    case ClassOrStructConstraintSyntax css:
+                    {
+                        var id = CreateNode(css, new[] { "CSharpConstraint" }, new[]
+                        {
+                            KV("typeParameter", typeParameter),
+                            KV("kind", css.ClassOrStructKeyword.Text),
+                        });
+                        AddRel(ownerId, "HAS_CONSTRAINT", id);
+                        break;
+                    }
+                    case ConstructorConstraintSyntax ctorConstraint:
+                    {
+                        var id = CreateNode(ctorConstraint, new[] { "CSharpConstraint" }, new[]
+                        {
+                            KV("typeParameter", typeParameter),
+                            KV("kind", "new()"),
+                        });
+                        AddRel(ownerId, "HAS_CONSTRAINT", id);
+                        break;
+                    }
+                    case DefaultConstraintSyntax defaultConstraint:
+                    {
+                        var id = CreateNode(defaultConstraint, new[] { "CSharpConstraint" }, new[]
+                        {
+                            KV("typeParameter", typeParameter),
+                            KV("kind", "default"),
+                        });
+                        AddRel(ownerId, "HAS_CONSTRAINT", id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Walks a LINQ query's clause pipeline in source order — an optional leading
+    /// `from` (absent when recursing into an `into` continuation), the body's
+    /// from/let/where/join/orderby clauses, its final select/group clause, and
+    /// any further continuation — attaching each to <paramref name="ownerId"/>
+    /// via :HAS_CLAUSE with an `ordinal` reflecting pipeline position.
+    /// </summary>
+    private void BuildQueryBody(FromClauseSyntax? fromClause, QueryBodySyntax body, string ownerId)
+    {
+        var ordinal = 0;
+        if (fromClause is not null)
+        {
+            AddRel(ownerId, "HAS_CLAUSE", BuildNode(fromClause, null, null), new[] { KV("ordinal", ordinal++) });
+        }
+        foreach (var clause in body.Clauses)
+        {
+            AddRel(ownerId, "HAS_CLAUSE", BuildNode(clause, null, null), new[] { KV("ordinal", ordinal++) });
+        }
+        AddRel(ownerId, "HAS_CLAUSE", BuildNode(body.SelectOrGroup, null, null), new[] { KV("ordinal", ordinal++) });
+        if (body.Continuation is not null)
+        {
+            var continuationId = CreateNode(body.Continuation, new[] { "CSharpQueryContinuation" }, new[]
+            {
+                KV("identifier", body.Continuation.Identifier.ValueText),
+            });
+            AddRel(ownerId, "HAS_CONTINUATION", continuationId);
+            BuildQueryBody(null, body.Continuation.Body, continuationId);
+        }
+    }
+
     // -- tree walk -----------------------------------------------------
 
     private string? BuildNode(SyntaxNode node, string? parentEdge, string? parentId)
@@ -444,6 +559,11 @@ public sealed class GraphBuilder
                     KV("name", Path.GetFileName(_file)),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(cu.AttributeLists, id);
+                foreach (var ext in cu.Externs)
+                {
+                    BuildNode(ext, "USES", id);
+                }
                 foreach (var u in cu.Usings)
                 {
                     BuildNode(u, "USES", id);
@@ -456,6 +576,12 @@ public sealed class GraphBuilder
             }
             case GlobalStatementSyntax gs:
                 return BuildNode(gs.Statement, parentEdge, parentId);
+            case ExternAliasDirectiveSyntax ext:
+            {
+                var id = CreateNode(ext, new[] { "CSharpExternAliasDirective" }, new[] { KV("identifier", ext.Identifier.ValueText) });
+                AddRel(parentId, parentEdge, id);
+                break;
+            }
             case UsingDirectiveSyntax u:
             {
                 var name = u.Name?.ToString() ?? u.Alias?.Name.Identifier.ValueText ?? "";
@@ -472,6 +598,14 @@ public sealed class GraphBuilder
             {
                 var id = CreateDeclarationNode(ns, "CSharpNamespaceDeclaration", new[] { KV("name", ns.Name.ToString()) });
                 AddRel(parentId, parentEdge, id);
+                foreach (var ext in ns.Externs)
+                {
+                    BuildNode(ext, "USES", id);
+                }
+                foreach (var u in ns.Usings)
+                {
+                    BuildNode(u, "USES", id);
+                }
                 foreach (var member in ns.Members)
                 {
                     BuildNode(member, "CONTAINS", id);
@@ -482,6 +616,14 @@ public sealed class GraphBuilder
             {
                 var id = CreateDeclarationNode(fs, "CSharpNamespaceDeclaration", new[] { KV("name", fs.Name.ToString()) });
                 AddRel(parentId, parentEdge, id);
+                foreach (var ext in fs.Externs)
+                {
+                    BuildNode(ext, "USES", id);
+                }
+                foreach (var u in fs.Usings)
+                {
+                    BuildNode(u, "USES", id);
+                }
                 foreach (var member in fs.Members)
                 {
                     BuildNode(member, "CONTAINS", id);
@@ -501,7 +643,9 @@ public sealed class GraphBuilder
                     KV("typeParameters", c.TypeParameterList?.Parameters.Select(tp => tp.Identifier.ValueText).ToArray()),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(c.AttributeLists, id);
                 BuildBaseList(c.BaseList, id);
+                BuildConstraintClauses(c.ConstraintClauses, id);
                 foreach (var member in c.Members)
                 {
                     BuildNode(member, "DECLARES", id);
@@ -521,7 +665,16 @@ public sealed class GraphBuilder
                     KV("typeParameters", r.TypeParameterList?.Parameters.Select(tp => tp.Identifier.ValueText).ToArray()),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(r.AttributeLists, id);
                 BuildBaseList(r.BaseList, id, canHaveBaseClass: !isStruct);
+                BuildConstraintClauses(r.ConstraintClauses, id);
+                if (r.ParameterList is not null)
+                {
+                    for (var i = 0; i < r.ParameterList.Parameters.Count; i++)
+                    {
+                        AddRel(id, "HAS_PARAMETER", BuildNode(r.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
+                    }
+                }
                 foreach (var member in r.Members)
                 {
                     BuildNode(member, "DECLARES", id);
@@ -540,7 +693,9 @@ public sealed class GraphBuilder
                     KV("typeParameters", s.TypeParameterList?.Parameters.Select(tp => tp.Identifier.ValueText).ToArray()),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(s.AttributeLists, id);
                 BuildBaseList(s.BaseList, id, canHaveBaseClass: false);
+                BuildConstraintClauses(s.ConstraintClauses, id);
                 foreach (var member in s.Members)
                 {
                     BuildNode(member, "DECLARES", id);
@@ -556,7 +711,9 @@ public sealed class GraphBuilder
                     KV("typeParameters", i.TypeParameterList?.Parameters.Select(tp => tp.Identifier.ValueText).ToArray()),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(i.AttributeLists, id);
                 BuildBaseList(i.BaseList, id, canHaveBaseClass: false);
+                BuildConstraintClauses(i.ConstraintClauses, id);
                 foreach (var member in i.Members)
                 {
                     BuildNode(member, "DECLARES", id);
@@ -571,6 +728,7 @@ public sealed class GraphBuilder
                     KV("accessibility", Accessibility(e.Modifiers)),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(e.AttributeLists, id);
                 if (e.BaseList is not null)
                 {
                     foreach (var bt in e.BaseList.Types)
@@ -592,6 +750,7 @@ public sealed class GraphBuilder
                     KV("value", em.EqualsValue?.Value?.ToString()),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(em.AttributeLists, id);
                 break;
             }
             case DelegateDeclarationSyntax del:
@@ -603,10 +762,12 @@ public sealed class GraphBuilder
                     KV("accessibility", Accessibility(del.Modifiers)),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(del.AttributeLists, id);
                 AddRel(id, "RETURNS", AddTypeNode(del.ReturnType));
-                foreach (var p in del.ParameterList.Parameters)
+                BuildConstraintClauses(del.ConstraintClauses, id);
+                for (var i = 0; i < del.ParameterList.Parameters.Count; i++)
                 {
-                    BuildNode(p, "HAS_PARAMETER", id);
+                    AddRel(id, "HAS_PARAMETER", BuildNode(del.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
                 }
                 break;
             }
@@ -627,17 +788,19 @@ public sealed class GraphBuilder
                 });
                 _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(m.AttributeLists, id);
                 AddRel(id, "RETURNS", AddTypeNode(m.ReturnType));
+                BuildConstraintClauses(m.ConstraintClauses, id);
                 if (m.TypeParameterList is not null)
                 {
-                    foreach (var tp in m.TypeParameterList.Parameters)
+                    for (var i = 0; i < m.TypeParameterList.Parameters.Count; i++)
                     {
-                        BuildNode(tp, "HAS_TYPE_PARAMETER", id);
+                        AddRel(id, "HAS_TYPE_PARAMETER", BuildNode(m.TypeParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
                     }
                 }
-                foreach (var p in m.ParameterList.Parameters)
+                for (var i = 0; i < m.ParameterList.Parameters.Count; i++)
                 {
-                    BuildNode(p, "HAS_PARAMETER", id);
+                    AddRel(id, "HAS_PARAMETER", BuildNode(m.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
                 }
                 if (m.Body is not null)
                 {
@@ -661,9 +824,10 @@ public sealed class GraphBuilder
                 });
                 _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
-                foreach (var p in ctor.ParameterList.Parameters)
+                BuildAttributeLists(ctor.AttributeLists, id);
+                for (var i = 0; i < ctor.ParameterList.Parameters.Count; i++)
                 {
-                    BuildNode(p, "HAS_PARAMETER", id);
+                    AddRel(id, "HAS_PARAMETER", BuildNode(ctor.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
                 }
                 if (ctor.Initializer is not null)
                 {
@@ -685,12 +849,71 @@ public sealed class GraphBuilder
                 });
                 _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(dtor.AttributeLists, id);
                 if (dtor.Body is not null)
                 {
                     BuildNode(dtor.Body, "HAS_BODY", id);
                 }
                 _methodStack.Pop();
                 BuildCfg(dtor);
+                break;
+            }
+            case OperatorDeclarationSyntax op:
+            {
+                var id = CreateDeclarationNode(op, "CSharpOperatorDeclaration", new[]
+                {
+                    KV("operator", op.OperatorToken.Text),
+                    KV("returnType", op.ReturnType.ToString()),
+                    KV("accessibility", Accessibility(op.Modifiers)),
+                    KV("isStatic", op.Modifiers.Any(SyntaxKind.StaticKeyword)),
+                });
+                _methodStack.Push(id);
+                AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(op.AttributeLists, id);
+                AddRel(id, "RETURNS", AddTypeNode(op.ReturnType));
+                for (var i = 0; i < op.ParameterList.Parameters.Count; i++)
+                {
+                    AddRel(id, "HAS_PARAMETER", BuildNode(op.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
+                }
+                if (op.Body is not null)
+                {
+                    BuildNode(op.Body, "HAS_BODY", id);
+                }
+                else if (op.ExpressionBody is not null)
+                {
+                    BuildNode(op.ExpressionBody, "HAS_BODY", id);
+                }
+                _methodStack.Pop();
+                BuildCfg(op);
+                break;
+            }
+            case ConversionOperatorDeclarationSyntax co:
+            {
+                var id = CreateDeclarationNode(co, "CSharpConversionOperatorDeclaration", new[]
+                {
+                    KV("kind", co.ImplicitOrExplicitKeyword.Text),
+                    KV("returnType", co.Type.ToString()),
+                    KV("accessibility", Accessibility(co.Modifiers)),
+                    KV("isStatic", co.Modifiers.Any(SyntaxKind.StaticKeyword)),
+                });
+                _methodStack.Push(id);
+                AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(co.AttributeLists, id);
+                AddRel(id, "RETURNS", AddTypeNode(co.Type));
+                for (var i = 0; i < co.ParameterList.Parameters.Count; i++)
+                {
+                    AddRel(id, "HAS_PARAMETER", BuildNode(co.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
+                }
+                if (co.Body is not null)
+                {
+                    BuildNode(co.Body, "HAS_BODY", id);
+                }
+                else if (co.ExpressionBody is not null)
+                {
+                    BuildNode(co.ExpressionBody, "HAS_BODY", id);
+                }
+                _methodStack.Pop();
+                BuildCfg(co);
                 break;
             }
             case PropertyDeclarationSyntax pr:
@@ -707,7 +930,9 @@ public sealed class GraphBuilder
                     KV("hasGetter", pr.AccessorList?.Accessors.Any(a => a.Kind() == SyntaxKind.GetAccessorDeclaration) ?? false),
                     KV("hasSetter", pr.AccessorList?.Accessors.Any(a => a.Kind() == SyntaxKind.SetAccessorDeclaration) ?? false),
                 });
+                _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(pr.AttributeLists, id);
                 AddRel(id, "OF_TYPE", AddTypeNode(pr.Type));
                 if (pr.AccessorList is not null)
                 {
@@ -724,6 +949,11 @@ public sealed class GraphBuilder
                 {
                     BuildNode(pr.Initializer, "INITIALIZER", id);
                 }
+                _methodStack.Pop();
+                if (pr.ExpressionBody is not null)
+                {
+                    BuildCfg(pr.ExpressionBody);
+                }
                 break;
             }
             case IndexerDeclarationSyntax idx:
@@ -733,10 +963,12 @@ public sealed class GraphBuilder
                     KV("type", idx.Type.ToString()),
                     KV("accessibility", Accessibility(idx.Modifiers)),
                 });
+                _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
-                foreach (var p in idx.ParameterList.Parameters)
+                BuildAttributeLists(idx.AttributeLists, id);
+                for (var i = 0; i < idx.ParameterList.Parameters.Count; i++)
                 {
-                    BuildNode(p, "HAS_PARAMETER", id);
+                    AddRel(id, "HAS_PARAMETER", BuildNode(idx.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
                 }
                 if (idx.AccessorList is not null)
                 {
@@ -749,6 +981,11 @@ public sealed class GraphBuilder
                 {
                     BuildNode(idx.ExpressionBody, "HAS_BODY", id);
                 }
+                _methodStack.Pop();
+                if (idx.ExpressionBody is not null)
+                {
+                    BuildCfg(idx.ExpressionBody);
+                }
                 break;
             }
             case AccessorDeclarationSyntax acc:
@@ -756,6 +993,7 @@ public sealed class GraphBuilder
                 var id = CreateNode(acc, new[] { "CSharpAccessor" }, new[] { KV("kind", acc.Keyword.ValueText) });
                 _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(acc.AttributeLists, id);
                 if (acc.Body is not null)
                 {
                     BuildNode(acc.Body, "HAS_BODY", id);
@@ -779,6 +1017,7 @@ public sealed class GraphBuilder
                     KV("isReadOnly", f.Modifiers.Any(SyntaxKind.ReadOnlyKeyword)),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(f.AttributeLists, id);
                 AddRel(id, "OF_TYPE", AddTypeNode(f.Declaration.Type));
                 foreach (var v in f.Declaration.Variables)
                 {
@@ -794,6 +1033,7 @@ public sealed class GraphBuilder
                     KV("accessibility", Accessibility(ef.Modifiers)),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(ef.AttributeLists, id);
                 foreach (var v in ef.Declaration.Variables)
                 {
                     BuildNode(v, "DECLARES", id);
@@ -809,6 +1049,7 @@ public sealed class GraphBuilder
                     KV("accessibility", Accessibility(ev.Modifiers)),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(ev.AttributeLists, id);
                 if (ev.AccessorList is not null)
                 {
                     foreach (var a in ev.AccessorList.Accessors)
@@ -859,6 +1100,7 @@ public sealed class GraphBuilder
                     KV("hasDefault", p.Default is not null),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(p.AttributeLists, id);
                 if (p.Type is not null)
                 {
                     AddRel(id, "OF_TYPE", AddTypeNode(p.Type));
@@ -877,6 +1119,7 @@ public sealed class GraphBuilder
                     KV("variance", tp.VarianceKeyword.ValueText),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(tp.AttributeLists, id);
                 break;
             }
 
@@ -896,6 +1139,7 @@ public sealed class GraphBuilder
                     KV("isUsing", lds.UsingKeyword != default),
                 });
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(lds.AttributeLists, id);
                 BuildNode(lds.Declaration, "DECLARES", id);
                 break;
             }
@@ -997,9 +1241,9 @@ public sealed class GraphBuilder
                 var id = CreateStatementNode(sw, "CSharpSwitchStatement", Array.Empty<KeyValuePair<string, object?>>());
                 AddRel(parentId, parentEdge, id);
                 BuildNode(sw.Expression, "HAS_EXPRESSION", id);
-                foreach (var section in sw.Sections)
+                for (var i = 0; i < sw.Sections.Count; i++)
                 {
-                    BuildNode(section, "HAS_CASE", id);
+                    AddRel(id, "HAS_CASE", BuildNode(sw.Sections[i], null, null), new[] { KV("ordinal", i) });
                 }
                 break;
             }
@@ -1072,9 +1316,9 @@ public sealed class GraphBuilder
                 var id = CreateStatementNode(t, "CSharpTryStatement", Array.Empty<KeyValuePair<string, object?>>());
                 AddRel(parentId, parentEdge, id);
                 BuildNode(t.Block, "HAS_BODY", id);
-                foreach (var cc in t.Catches)
+                for (var i = 0; i < t.Catches.Count; i++)
                 {
-                    BuildNode(cc, "HAS_CATCH", id);
+                    AddRel(id, "HAS_CATCH", BuildNode(t.Catches[i], null, null), new[] { KV("ordinal", i) });
                 }
                 if (t.Finally is not null)
                 {
@@ -1146,10 +1390,12 @@ public sealed class GraphBuilder
                 });
                 _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
+                BuildAttributeLists(lf.AttributeLists, id);
                 AddRel(id, "RETURNS", AddTypeNode(lf.ReturnType));
-                foreach (var p in lf.ParameterList.Parameters)
+                BuildConstraintClauses(lf.ConstraintClauses, id);
+                for (var i = 0; i < lf.ParameterList.Parameters.Count; i++)
                 {
-                    BuildNode(p, "HAS_PARAMETER", id);
+                    AddRel(id, "HAS_PARAMETER", BuildNode(lf.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
                 }
                 if (lf.Body is not null)
                 {
@@ -1203,9 +1449,9 @@ public sealed class GraphBuilder
                 props.AddRange(SymbolProps(gn));
                 var id = CreateExpressionNode(gn, "CSharpGenericName", props);
                 AddRel(parentId, parentEdge, id);
-                foreach (var ta in gn.TypeArgumentList.Arguments)
+                for (var i = 0; i < gn.TypeArgumentList.Arguments.Count; i++)
                 {
-                    AddRel(id, "HAS_TYPE_ARGUMENT", AddTypeNode(ta));
+                    AddRel(id, "HAS_TYPE_ARGUMENT", AddTypeNode(gn.TypeArgumentList.Arguments[i]), new[] { KV("ordinal", i) });
                 }
                 break;
             }
@@ -1250,9 +1496,9 @@ public sealed class GraphBuilder
                 BuildNode(inv.Expression, "HAS_FUNCTION", id);
                 if (inv.ArgumentList is not null)
                 {
-                    foreach (var a in inv.ArgumentList.Arguments)
+                    for (var i = 0; i < inv.ArgumentList.Arguments.Count; i++)
                     {
-                        BuildNode(a, "HAS_ARGUMENT", id);
+                        AddRel(id, "HAS_ARGUMENT", BuildNode(inv.ArgumentList.Arguments[i], null, null), new[] { KV("ordinal", i) });
                     }
                 }
                 break;
@@ -1270,9 +1516,9 @@ public sealed class GraphBuilder
                 AddCallEdge(oc);
                 if (oc.ArgumentList is not null)
                 {
-                    foreach (var a in oc.ArgumentList.Arguments)
+                    for (var i = 0; i < oc.ArgumentList.Arguments.Count; i++)
                     {
-                        BuildNode(a, "HAS_ARGUMENT", id);
+                        AddRel(id, "HAS_ARGUMENT", BuildNode(oc.ArgumentList.Arguments[i], null, null), new[] { KV("ordinal", i) });
                     }
                 }
                 if (oc.Initializer is not null)
@@ -1292,6 +1538,16 @@ public sealed class GraphBuilder
                 });
                 AddRel(parentId, parentEdge, id);
                 BuildNode(arg.Expression, "HAS_EXPRESSION", id);
+                break;
+            }
+            case AttributeArgumentSyntax attrArg:
+            {
+                var id = CreateNode(attrArg, new[] { "CSharpAttributeArgument", "CSharpExpression" }, new[]
+                {
+                    KV("name", attrArg.NameEquals?.Name.Identifier.ValueText ?? attrArg.NameColon?.Name.Identifier.ValueText),
+                });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(attrArg.Expression, "HAS_EXPRESSION", id);
                 break;
             }
             case ArgumentListSyntax al:
@@ -1314,8 +1570,8 @@ public sealed class GraphBuilder
                     KV("text", be.ToString()),
                 });
                 AddRel(parentId, parentEdge, id);
-                BuildNode(be.Left, "HAS_OPERAND", id);
-                BuildNode(be.Right, "HAS_OPERAND", id);
+                AddRel(id, "HAS_OPERAND", BuildNode(be.Left, null, null), new[] { KV("ordinal", 0) });
+                AddRel(id, "HAS_OPERAND", BuildNode(be.Right, null, null), new[] { KV("ordinal", 1) });
                 break;
             }
             case AssignmentExpressionSyntax ae:
@@ -1361,6 +1617,28 @@ public sealed class GraphBuilder
                 BuildNode(cond.WhenFalse, "HAS_ELSE", id);
                 break;
             }
+            case SwitchExpressionSyntax swe:
+            {
+                var id = CreateExpressionNode(swe, "CSharpSwitchExpression", new[] { KV("text", swe.ToString()) });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(swe.GoverningExpression, "HAS_EXPRESSION", id);
+                for (var i = 0; i < swe.Arms.Count; i++)
+                {
+                    AddRel(id, "HAS_ARM", BuildNode(swe.Arms[i], null, null), new[] { KV("ordinal", i) });
+                }
+                break;
+            }
+            case SwitchExpressionArmSyntax arm:
+            {
+                var id = CreateNode(arm, new[] { "CSharpSwitchExpressionArm" }, new[]
+                {
+                    KV("pattern", arm.Pattern.ToString()),
+                    KV("whenCondition", arm.WhenClause?.Condition.ToString()),
+                });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(arm.Expression, "HAS_EXPRESSION", id);
+                break;
+            }
             case CastExpressionSyntax cast:
             {
                 var id = CreateExpressionNode(cast, "CSharpCastExpression", new[]
@@ -1379,9 +1657,9 @@ public sealed class GraphBuilder
                 BuildNode(ea.Expression, "HAS_EXPRESSION", id);
                 if (ea.ArgumentList is not null)
                 {
-                    foreach (var a in ea.ArgumentList.Arguments)
+                    for (var i = 0; i < ea.ArgumentList.Arguments.Count; i++)
                     {
-                        BuildNode(a, "HAS_ARGUMENT", id);
+                        AddRel(id, "HAS_ARGUMENT", BuildNode(ea.ArgumentList.Arguments[i], null, null), new[] { KV("ordinal", i) });
                     }
                 }
                 break;
@@ -1389,29 +1667,52 @@ public sealed class GraphBuilder
             case SimpleLambdaExpressionSyntax sl:
             {
                 var id = CreateExpressionNode(sl, "CSharpLambdaExpression", new[] { KV("text", sl.ToString()) });
+                _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
                 BuildNode(sl.Parameter, "HAS_PARAMETER", id);
                 BuildNode(sl.Body, "HAS_BODY", id);
+                _methodStack.Pop();
+                BuildCfg(sl);
                 break;
             }
             case ParenthesizedLambdaExpressionSyntax pl:
             {
                 var id = CreateExpressionNode(pl, "CSharpLambdaExpression", new[] { KV("text", pl.ToString()) });
+                _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
-                foreach (var p in pl.ParameterList.Parameters)
+                for (var i = 0; i < pl.ParameterList.Parameters.Count; i++)
                 {
-                    BuildNode(p, "HAS_PARAMETER", id);
+                    AddRel(id, "HAS_PARAMETER", BuildNode(pl.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
                 }
                 BuildNode(pl.Body, "HAS_BODY", id);
+                _methodStack.Pop();
+                BuildCfg(pl);
+                break;
+            }
+            case AnonymousMethodExpressionSyntax am:
+            {
+                var id = CreateExpressionNode(am, "CSharpAnonymousMethodExpression", new[] { KV("text", am.ToString()) });
+                _methodStack.Push(id);
+                AddRel(parentId, parentEdge, id);
+                if (am.ParameterList is not null)
+                {
+                    for (var i = 0; i < am.ParameterList.Parameters.Count; i++)
+                    {
+                        AddRel(id, "HAS_PARAMETER", BuildNode(am.ParameterList.Parameters[i], null, null), new[] { KV("ordinal", i) });
+                    }
+                }
+                BuildNode(am.Block, "HAS_BODY", id);
+                _methodStack.Pop();
+                BuildCfg(am);
                 break;
             }
             case TupleExpressionSyntax te:
             {
                 var id = CreateExpressionNode(te, "CSharpTupleExpression", new[] { KV("text", te.ToString()) });
                 AddRel(parentId, parentEdge, id);
-                foreach (var a in te.Arguments)
+                for (var i = 0; i < te.Arguments.Count; i++)
                 {
-                    BuildNode(a, "HAS_ARGUMENT", id);
+                    AddRel(id, "HAS_ARGUMENT", BuildNode(te.Arguments[i], null, null), new[] { KV("ordinal", i) });
                 }
                 break;
             }
@@ -1419,11 +1720,12 @@ public sealed class GraphBuilder
             {
                 var id = CreateExpressionNode(istr, "CSharpInterpolatedStringExpression", new[] { KV("text", istr.ToString()) });
                 AddRel(parentId, parentEdge, id);
+                var holeOrdinal = 0;
                 foreach (var content in istr.Contents)
                 {
                     if (content is InterpolationSyntax interp)
                     {
-                        BuildNode(interp.Expression, "HAS_OPERAND", id);
+                        AddRel(id, "HAS_OPERAND", BuildNode(interp.Expression, null, null), new[] { KV("ordinal", holeOrdinal++) });
                     }
                 }
                 break;
@@ -1436,9 +1738,9 @@ public sealed class GraphBuilder
                     KV("text", init.ToString()),
                 });
                 AddRel(parentId, parentEdge, id);
-                foreach (var e in init.Expressions)
+                for (var i = 0; i < init.Expressions.Count; i++)
                 {
-                    BuildNode(e, "HAS_ELEMENT", id);
+                    AddRel(id, "HAS_ELEMENT", BuildNode(init.Expressions[i], null, null), new[] { KV("ordinal", i) });
                 }
                 break;
             }
@@ -1449,10 +1751,103 @@ public sealed class GraphBuilder
                     KV("kind", ci.Kind() == SyntaxKind.BaseConstructorInitializer ? "base" : "this"),
                 });
                 AddRel(parentId, parentEdge, id);
-                foreach (var a in ci.ArgumentList.Arguments)
+                for (var i = 0; i < ci.ArgumentList.Arguments.Count; i++)
                 {
-                    BuildNode(a, "HAS_ARGUMENT", id);
+                    AddRel(id, "HAS_ARGUMENT", BuildNode(ci.ArgumentList.Arguments[i], null, null), new[] { KV("ordinal", i) });
                 }
+                break;
+            }
+            case QueryExpressionSyntax qe:
+            {
+                var id = CreateExpressionNode(qe, "CSharpQueryExpression", new[] { KV("text", qe.ToString()) });
+                AddRel(parentId, parentEdge, id);
+                BuildQueryBody(qe.FromClause, qe.Body, id);
+                break;
+            }
+            case FromClauseSyntax fc:
+            {
+                var id = CreateNode(fc, new[] { "CSharpQueryClause" }, new[]
+                {
+                    KV("kind", "from"),
+                    KV("identifier", fc.Identifier.ValueText),
+                });
+                AddRel(parentId, parentEdge, id);
+                if (fc.Type is not null)
+                {
+                    AddRel(id, "OF_TYPE", AddTypeNode(fc.Type));
+                }
+                BuildNode(fc.Expression, "HAS_EXPRESSION", id);
+                break;
+            }
+            case LetClauseSyntax lc:
+            {
+                var id = CreateNode(lc, new[] { "CSharpQueryClause" }, new[]
+                {
+                    KV("kind", "let"),
+                    KV("identifier", lc.Identifier.ValueText),
+                });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(lc.Expression, "HAS_EXPRESSION", id);
+                break;
+            }
+            case WhereClauseSyntax wc:
+            {
+                var id = CreateNode(wc, new[] { "CSharpQueryClause" }, new[] { KV("kind", "where") });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(wc.Condition, "HAS_CONDITION", id);
+                break;
+            }
+            case JoinClauseSyntax jc:
+            {
+                var id = CreateNode(jc, new[] { "CSharpQueryClause" }, new[]
+                {
+                    KV("kind", "join"),
+                    KV("identifier", jc.Identifier.ValueText),
+                    KV("into", jc.Into?.Identifier.ValueText),
+                });
+                AddRel(parentId, parentEdge, id);
+                if (jc.Type is not null)
+                {
+                    AddRel(id, "OF_TYPE", AddTypeNode(jc.Type));
+                }
+                BuildNode(jc.InExpression, "HAS_EXPRESSION", id);
+                BuildNode(jc.LeftExpression, "HAS_CONDITION", id);
+                BuildNode(jc.RightExpression, "HAS_CONDITION", id);
+                break;
+            }
+            case OrderByClauseSyntax oc:
+            {
+                var id = CreateNode(oc, new[] { "CSharpQueryClause" }, new[] { KV("kind", "orderby") });
+                AddRel(parentId, parentEdge, id);
+                for (var i = 0; i < oc.Orderings.Count; i++)
+                {
+                    AddRel(id, "HAS_ORDERING", BuildNode(oc.Orderings[i], null, null), new[] { KV("ordinal", i) });
+                }
+                break;
+            }
+            case OrderingSyntax ord:
+            {
+                var id = CreateNode(ord, new[] { "CSharpOrdering" }, new[]
+                {
+                    KV("direction", ord.Kind() == SyntaxKind.DescendingOrdering ? "descending" : "ascending"),
+                });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(ord.Expression, "HAS_EXPRESSION", id);
+                break;
+            }
+            case SelectClauseSyntax sc:
+            {
+                var id = CreateNode(sc, new[] { "CSharpQueryClause" }, new[] { KV("kind", "select") });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(sc.Expression, "HAS_EXPRESSION", id);
+                break;
+            }
+            case GroupClauseSyntax gc:
+            {
+                var id = CreateNode(gc, new[] { "CSharpQueryClause" }, new[] { KV("kind", "group") });
+                AddRel(parentId, parentEdge, id);
+                BuildNode(gc.GroupExpression, "HAS_EXPRESSION", id);
+                BuildNode(gc.ByExpression, "HAS_KEY", id);
                 break;
             }
             case ArrowExpressionClauseSyntax aec:
@@ -1491,9 +1886,10 @@ public sealed class GraphBuilder
                     KV("text", expr.ToString()),
                 });
                 AddRel(parentId, parentEdge, id);
+                var fallbackOrdinal = 0;
                 foreach (var child in expr.ChildNodes().OfType<ExpressionSyntax>())
                 {
-                    BuildNode(child, "HAS_OPERAND", id);
+                    AddRel(id, "HAS_OPERAND", BuildNode(child, null, null), new[] { KV("ordinal", fallbackOrdinal++) });
                 }
                 break;
             }
