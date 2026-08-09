@@ -59,7 +59,7 @@ def main(argv=None) -> int:
         "--cfg",
         dest="emit_cfg",
         action="store_true",
-        help="also emit control-flow-graph basic blocks (requires the 'py2cfg' package)",
+        help="also emit control-flow-graph basic blocks",
     )
     parser.add_argument(
         "--souffle",
@@ -67,7 +67,7 @@ def main(argv=None) -> int:
         action="store_true",
         help=(
             "emit a Souffle datalog program for the control-flow graphs on stdout "
-            "instead of Cypher (implies --cfg; requires the 'py2cfg' package)"
+            "instead of Cypher (implies --cfg)"
         ),
     )
     args = parser.parse_args(argv)

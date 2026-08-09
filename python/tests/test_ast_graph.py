@@ -168,15 +168,93 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(imp.properties["module"], "pathlib")
 
 
-try:
-    from py2cfg.builder import CFGBuilder as _Py2CfgBuilder  # noqa: F401
-    _PY2CFG_AVAILABLE = True
-except ImportError:
-    _PY2CFG_AVAILABLE = False
+class OrderTests(unittest.TestCase):
+    """Ordinal/FOLLOWS parity with the C# extractor: order should be a
+    queryable graph fact, not something recovered from `startLine`/`startColumn`."""
+
+    def test_statements_in_a_body_are_chained_with_follows(self):
+        nodes, rels = build("def f():\n    a = 1\n    b = 2\n    c = 3\n")
+        func = next(n for n in nodes if "PythonFunctionDefinition" in n.labels)
+        contains = [r for r in rels if r.source == func.id and r.type == "CONTAINS"]
+        stmt_ids = [r.target for r in contains]
+        follows = [r for r in rels if r.type == "FOLLOWS"]
+        self.assertEqual(len(follows), 2)
+        self.assertTrue(any(f.source == stmt_ids[0] and f.target == stmt_ids[1] for f in follows))
+        self.assertTrue(any(f.source == stmt_ids[1] and f.target == stmt_ids[2] for f in follows))
+
+    def test_module_and_class_bodies_also_get_follows(self):
+        nodes, rels = build("x = 1\ny = 2\n")
+        module = next(n for n in nodes if "PythonModule" in n.labels)
+        contains = [r for r in rels if r.source == module.id and r.type == "CONTAINS"]
+        follows = [r for r in rels if r.type == "FOLLOWS"]
+        self.assertEqual(len(follows), 1)
+        self.assertEqual(follows[0].source, contains[0].target)
+        self.assertEqual(follows[0].target, contains[1].target)
+
+    def test_binary_operands_carry_ordinal_across_separate_fields(self):
+        nodes, rels = build("x = a - b\n")
+        binop = next(n for n in nodes if "PythonBinaryOperation" in n.labels)
+        operands = sorted(
+            (r for r in rels if r.source == binop.id and r.type == "HAS_OPERAND"),
+            key=lambda r: r.properties["ordinal"],
+        )
+        self.assertEqual([r.properties["ordinal"] for r in operands], [0, 1])
+        left = next(n for n in nodes if n.id == operands[0].target)
+        right = next(n for n in nodes if n.id == operands[1].target)
+        self.assertEqual(left.properties["name"], "a")
+        self.assertEqual(right.properties["name"], "b")
+
+    def test_chained_comparison_operands_are_in_source_order(self):
+        nodes, rels = build("y = a < b < c\n")
+        compare = next(n for n in nodes if "PythonComparison" in n.labels)
+        operands = sorted(
+            (r for r in rels if r.source == compare.id and r.type == "HAS_OPERAND"),
+            key=lambda r: r.properties["ordinal"],
+        )
+        names = [next(n for n in nodes if n.id == r.target).properties["name"] for r in operands]
+        self.assertEqual(names, ["a", "b", "c"])
+
+    def test_call_arguments_carry_ordinal(self):
+        nodes, rels = build("F(x, y, z)\n")
+        call = next(n for n in nodes if "PythonCall" in n.labels)
+        args = sorted(
+            (r for r in rels if r.source == call.id and r.type == "HAS_ARGUMENT"),
+            key=lambda r: r.properties["ordinal"],
+        )
+        names = [next(n for n in nodes if n.id == r.target).properties["name"] for r in args]
+        self.assertEqual(names, ["x", "y", "z"])
+
+    def test_parameters_carry_ordinal_in_calling_convention_order(self):
+        nodes, rels = build("def f(a, b, *args, c, **kwargs):\n    pass\n")
+        func = next(n for n in nodes if "PythonFunctionDefinition" in n.labels)
+        params = sorted(
+            (r for r in rels if r.source == func.id and r.type == "HAS_PARAMETER"),
+            key=lambda r: r.properties["ordinal"],
+        )
+        names = [next(n for n in nodes if n.id == r.target).properties["name"] for r in params]
+        self.assertEqual(names, ["a", "b", "args", "c", "kwargs"])
+
+    def test_decorators_carry_ordinal(self):
+        nodes, rels = build("@first\n@second\ndef f():\n    pass\n")
+        func = next(n for n in nodes if "PythonFunctionDefinition" in n.labels)
+        decorators = sorted(
+            (r for r in rels if r.source == func.id and r.type == "HAS_DECORATOR"),
+            key=lambda r: r.properties["ordinal"],
+        )
+        names = [next(n for n in nodes if n.id == r.target).properties["name"] for r in decorators]
+        self.assertEqual(names, ["first", "second"])
+
+    def test_dict_values_use_has_value_not_has_operand(self):
+        nodes, rels = build("d = {'a': 1, 'b': 2}\n")
+        d = next(n for n in nodes if "PythonDictionary" in n.labels)
+        types = {r.type for r in rels if r.source == d.id}
+        self.assertIn("HAS_KEY", types)
+        self.assertIn("HAS_VALUE", types)
+        self.assertNotIn("HAS_OPERAND", types)
 
 
 def build_with_cfg(source, filename="test.py"):
-    """Run the graph builder including the py2cfg control-flow pass."""
+    """Run the graph builder including the (stdlib-only) control-flow pass."""
     tree = ast.parse(source, filename=filename, type_comments=True)
     builder = GraphBuilder(source, filename)
     builder.build(tree)
@@ -184,7 +262,6 @@ def build_with_cfg(source, filename="test.py"):
     return builder._nodes, builder._relationships
 
 
-@unittest.skipUnless(_PY2CFG_AVAILABLE, "py2cfg is not installed")
 class CfgTests(unittest.TestCase):
     def test_while_loop_emits_blocks_and_conditional_edges(self):
         source = "def f(x):\n    while x < 10:\n        x = x + 1\n    return x\n"
@@ -202,7 +279,7 @@ class CfgTests(unittest.TestCase):
         )
         self.assertTrue(
             any("x >= 10" in r.properties["condition"] for r in conditional),
-            "false branch should carry the negated condition",
+            "false branch should carry the negated (operator-flipped) condition",
         )
 
         # The body block links (CONTAINS) to the assignment statement node.
@@ -226,6 +303,151 @@ class CfgTests(unittest.TestCase):
         blocks = [n for n in nodes if "PythonBasicBlock" in n.labels]
         self.assertTrue(any(n.properties.get("isEntry") for n in blocks))
         self.assertTrue(any(n.properties.get("isFinal") for n in blocks))
+
+    def test_module_and_class_scopes_get_a_cfg_too(self):
+        source = "x = 1\nclass C:\n    y = 2\n    def m(self):\n        return self.y\n"
+        nodes, _ = build_with_cfg(source)
+
+        scopes = {n.properties["scope"] for n in nodes if "PythonBasicBlock" in n.labels}
+        self.assertIn("test", scopes)
+        self.assertIn("test.C", scopes)
+        self.assertIn("test.C.m", scopes)
+
+    def test_not_negates_by_dropping_the_not(self):
+        source = "def f(name):\n    if not name:\n        return 1\n    return 2\n"
+        _, rels = build_with_cfg(source)
+        conditions = {
+            r.properties["condition"]
+            for r in rels
+            if r.type == "FOLLOWS" and r.properties and "condition" in r.properties
+        }
+        self.assertIn("not name", conditions)
+        self.assertIn("name", conditions)
+        self.assertNotIn("not not name", conditions)
+
+    def test_unreachable_code_after_return_is_flagged(self):
+        source = "def f():\n    return 1\n    x = 2\n"
+        nodes, _ = build_with_cfg(source)
+        blocks = [n for n in nodes if "PythonBasicBlock" in n.labels]
+        self.assertTrue(any(not b.properties.get("isReachable", True) for b in blocks))
+        assign_block = next(
+            b for b in blocks if not b.properties.get("isReachable", True)
+        )
+        self.assertEqual(assign_block.properties.get("kind"), "Assign")
+
+    def test_for_loop_body_and_else_and_break(self):
+        source = (
+            "def f(xs):\n"
+            "    for x in xs:\n"
+            "        if x < 0:\n"
+            "            break\n"
+            "    else:\n"
+            "        return 'done'\n"
+            "    return 'broke'\n"
+        )
+        nodes, rels = build_with_cfg(source)
+        blocks = [n for n in nodes if "PythonBasicBlock" in n.labels]
+        self.assertGreaterEqual(len(blocks), 5)
+        # `break` must reach the same block as the code after the for/else,
+        # not the `else` clause (break skips a loop's `else`).
+        break_id = next(n.id for n in nodes if "PythonBreakStatement" in n.labels)
+        break_block = next(
+            b for b in blocks
+            if any(r.source == b.id and r.target == break_id and r.type == "CONTAINS" for r in rels)
+        )
+        break_targets = {r.target for r in rels if r.type == "FOLLOWS" and r.source == break_block.id}
+        else_block_ids = {
+            b.id for b in blocks
+            if any(
+                r.source == b.id and r.type == "CONTAINS"
+                and any(n.id == r.target and "value" in n.properties and n.properties.get("value") == "done"
+                        for n in nodes)
+                for r in rels
+            )
+        }
+        self.assertFalse(break_targets & else_block_ids)
+
+    def test_match_statement_branches_per_case(self):
+        source = (
+            "def f(value):\n"
+            "    match value:\n"
+            "        case 0:\n"
+            "            return 'zero'\n"
+            "        case int() as i if i > 0:\n"
+            "            return 'positive'\n"
+            "        case _:\n"
+            "            return 'other'\n"
+        )
+        nodes, rels = build_with_cfg(source)
+        blocks = [n for n in nodes if "PythonBasicBlock" in n.labels]
+        # One block per case body plus the blocks chaining the pattern tests.
+        self.assertGreaterEqual(len(blocks), 4)
+
+        follows = [r for r in rels if r.type == "FOLLOWS" and r.properties]
+        conditions = {r.properties.get("condition") for r in follows}
+        self.assertIn("0", conditions)
+        self.assertIn("int() as i if i > 0", conditions)
+        self.assertIn("_", conditions)
+
+        # The wildcard `case _` is irrefutable, so nothing should carry a
+        # "didn't match the wildcard" condition.
+        self.assertFalse(any(c and c.startswith("not (_") for c in conditions if c))
+
+    def test_match_without_wildcard_can_fall_through(self):
+        source = "def f(value):\n    match value:\n        case 0:\n            return 'zero'\n    return 'other'\n"
+        nodes, rels = build_with_cfg(source)
+        return_other_id = next(
+            n.id for n in nodes
+            if "PythonReturnStatement" in n.labels
+            and any(
+                r.source == n.id and r.type == "HAS_VALUE"
+                and any(t.id == r.target and t.properties.get("value") == "other" for t in nodes)
+                for r in rels
+            )
+        )
+        blocks = [n for n in nodes if "PythonBasicBlock" in n.labels]
+        return_block = next(
+            b for b in blocks
+            if any(r.source == b.id and r.target == return_other_id and r.type == "CONTAINS" for r in rels)
+        )
+        self.assertTrue(return_block.properties.get("isReachable"))
+
+    def test_try_except_finally_links_handler_and_finally(self):
+        source = (
+            "def f():\n"
+            "    try:\n"
+            "        risky()\n"
+            "    except ValueError:\n"
+            "        handle()\n"
+            "    finally:\n"
+            "        cleanup()\n"
+        )
+        nodes, rels = build_with_cfg(source)
+        follows = [r for r in rels if r.type == "FOLLOWS"]
+        conditions = {r.properties.get("condition") for r in follows if r.properties}
+        self.assertIn("ValueError", conditions)
+
+        # `finally` should be reachable from both the try body's normal exit
+        # and the handler's exit — i.e. exactly one block has 2 predecessors.
+        incoming_count = {}
+        for r in follows:
+            incoming_count[r.target] = incoming_count.get(r.target, 0) + 1
+        finally_block_id = next(block_id for block_id, count in incoming_count.items() if count >= 2)
+        finally_block = next(n for n in nodes if n.id == finally_block_id)
+        self.assertEqual(finally_block.properties.get("kind"), "Expr")
+
+    def test_cfg_contains_edges_carry_statement_ordinal(self):
+        source = "def f():\n    a = 1\n    b = 2\n    c = 3\n"
+        nodes, rels = build_with_cfg(source)
+        block = next(
+            n for n in nodes
+            if "PythonBasicBlock" in n.labels
+            and sum(1 for r in rels if r.source == n.id and r.type == "CONTAINS") == 3
+        )
+        ordinals = sorted(
+            r.properties["ordinal"] for r in rels if r.source == block.id and r.type == "CONTAINS"
+        )
+        self.assertEqual(ordinals, [0, 1, 2])
 
     def test_full_pipeline_emits_cfg_datalog(self):
         source = "def f(x):\n    while x < 10:\n        x = x + 1\n    return x\n"

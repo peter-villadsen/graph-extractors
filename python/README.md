@@ -64,13 +64,15 @@ autocommitted query when piped through `cypher-shell` — variables bound in
 one `CREATE` are not visible in the next one.
 
 With `--cfg` you also get the control-flow graph; a branch edge carries the
-condition that selects it (the false branch is py2cfg's negated condition):
+condition that selects it (the false branch is the negated condition —
+`not x < 10` simplifies to `x >= 10` for a comparison, or just drops a
+leading `not`; see [Control flow graphs](#control-flow-graphs)):
 
 ```cypher
-CREATE (p16:PythonBasicBlock {scope: 'greet.greet', ordinal: 0, blockId: 3, isEntry: true, kind: 'If', startLine: 2, id: 'p16'});
-MATCH (a {id: 'p16'}), (b {id: 'p17'}) CREATE (a)-[:FOLLOWS {condition: '(not name)'}]->(b);
-MATCH (a {id: 'p16'}), (b {id: 'p18'}) CREATE (a)-[:FOLLOWS {condition: '(not not name)'}]->(b);
-MATCH (a {id: 'p16'}), (b {id: 'p6'}) CREATE (a)-[:CONTAINS]->(b);
+CREATE (p17:PythonBasicBlock {scope: 'greet.greet', ordinal: 0, blockId: 0, isEntry: true, kind: 'If', startLine: 2, endLine: 3, id: 'p17'});
+MATCH (a {id: 'p17'}), (b {id: 'p19'}) CREATE (a)-[:FOLLOWS {condition: 'not name'}]->(b);
+MATCH (a {id: 'p17'}), (b {id: 'p20'}) CREATE (a)-[:FOLLOWS {condition: 'name'}]->(b);
+MATCH (a {id: 'p17'}), (b {id: 'p6'}) CREATE (a)-[:CONTAINS {ordinal: 0}]->(b);
 ```
 
 Import it into Neo4j, then query the graph:
@@ -95,9 +97,9 @@ ORDER BY b.blockId;
 
 ## Requirements
 
-* Python 3.10+ (3.12 recommended). Only the standard library is used for the
-  AST graph itself; the optional `--cfg` control-flow pass additionally needs
-  [`py2cfg`](https://pypi.org/project/py2cfg/) (`pip install py2cfg`).
+* Python 3.10+ (3.12 recommended). Only the standard library is used —
+  including the `--cfg` control-flow pass, which this extractor computes
+  itself (see [Control flow graphs](#control-flow-graphs)).
 
 ## Run
 
@@ -121,6 +123,17 @@ preceding statement as trivia.
 
 Node ids are `p1`, `p2`, … Every statement carries `PythonStatement` and every
 expression carries `PythonExpression` as an extra label for querying.
+
+**Order**: statements in a body are chained with `FOLLOWS` in source order.
+Wherever else order is semantically meaningful — binary/comparison operand
+order, call/decorator arguments, parameter lists (in calling-convention
+order: positional-only, positional, `*args`, keyword-only, `**kwargs`),
+`except`/`match`-case order (first-match-wins), and which statement runs
+first inside one CFG basic block — the relationship carries an integer
+`ordinal` property instead: `MATCH (n)-[r:HAS_ARGUMENT]->(a) RETURN a ORDER
+BY r.ordinal`. This applies even when a single edge type comes from more
+than one AST field, e.g. `BinOp`'s separate `left`/`right` fields (both
+`HAS_OPERAND`) still get ordinals `0`/`1` in source order.
 
 ## Node labels (a selection)
 
@@ -160,30 +173,76 @@ expression carries `PythonExpression` as an extra label for querying.
 
 ## Control flow graphs
 
-The extractor models the **control flow graph** of every function, opt-in via
-`--cfg`, using the third-party [`py2cfg`](https://pypi.org/project/py2cfg/)
-package (a pure-Python `ast` walker). Install it with `pip install py2cfg`;
-without it the extractor stays stdlib-only.
+The extractor models the **control flow graph** of the module and every
+function/method/class body, opt-in via `--cfg`, computed entirely with the
+standard library — no third-party dependency. (Earlier versions delegated
+this to the third-party [`py2cfg`](https://pypi.org/project/py2cfg/) package;
+it was dropped because it's unmaintained and has no support at all for
+Python's `match` statement, silently collapsing one to a single block. What
+this extractor actually needs from a CFG — block partitioning,
+branch-condition edges, one entry/exit per scope — turned out to be a small
+enough surface that a purpose-built builder was simpler than continuing to
+carry that dependency risk.)
 
-Each basic block becomes a `PythonBasicBlock` node with `ordinal`,
-`isEntry`/`isReachable`/`isFinal`, `scope` (the enclosing function/module),
-and source line span. Successor edges are `FOLLOWS` relationships; branch
-edges carry a `condition` property (with the false branch already negated by
-py2cfg). Every block links to the AST statement nodes it executes via
-`CONTAINS`.
+Every scope gets exactly one entry block and one exit block (mirroring how
+the C# extractor's Roslyn-based CFG always has a single Entry/Exit), with
+further blocks created only at actual branch points: `if`/`elif`/`else`,
+`while`/`for` (+ `else`, `break`, `continue`), `match`/`case` (**one block per
+case**, unlike the old dependency), and `try`/`except`/`else`/`finally`.
+Nested `def`/`class` bodies get their own independent CFG, scoped by dotted
+qualname (`module.Class.method`).
+
+Each basic block becomes a `PythonBasicBlock` node with `ordinal` (position
+within its scope), `isEntry`/`isFinal`/`isReachable`, `scope`, `kind` (the
+class name of its first statement), and source line span. Successor edges
+are `FOLLOWS` relationships; a real boolean branch (`if`/`while`, a `match`
+pattern test) carries a `condition` property with the text that selects it.
+Every block links to the AST statement nodes it executes via `CONTAINS`
+(with an `ordinal` for execution order within the block — see
+[Order](#how-it-works) above).
 
 ```cypher
-(:PythonBasicBlock)-[:FOLLOWS {condition: '(x < 10)'}]->(:PythonBasicBlock)
-(:PythonBasicBlock)-[:CONTAINS]->(:PythonStatement)
+(:PythonBasicBlock)-[:FOLLOWS {condition: 'x < 10'}]->(:PythonBasicBlock)
+(:PythonBasicBlock)-[:CONTAINS {ordinal: 0}]->(:PythonStatement)
 ```
 
-**Known limitation**: `py2cfg` 1.0.5 does not understand Python's `match`
-statement — it has no visitor for `ast.Match`/`ast.match_case`, so a `match`
-collapses to a single block instead of one branch per `case` (the way
-`if`/`elif`, `for`, and `while` are split). The CFG for a function that
-contains only a `match` is therefore truncated to one block. Prefer `if`/
-`elif` chains over `match` in code you intend to analyze with `--cfg` if
-branch-level CFG detail matters.
+**Negation**: the false branch's `condition` is a genuine negation of the
+test, simplified where cheap — a comparison flips its operator (`x < 10`
+negates to `x >= 10`), `not x` drops the `not` (double-negation
+elimination) — and falls back to `not (...)` wrapping the whole test
+otherwise (chained comparisons, `and`/`or`, calls, ...).
+
+**`match`**: each `case` gets its own block, reached by a `condition` edge
+carrying the pattern text (plus ` if <guard>` when present, e.g.
+`"int() as i if i > 0"`) chained like an `elif` ladder; a case whose pattern
+is an unconditional capture/wildcard (`case _:`, `case x:`, no guard) is
+treated as exhaustive, so there's no "didn't match" edge out of it. If no
+case is exhaustive, `match` can fall through having matched nothing, exactly
+like Python does at runtime — the CFG's "after" block is reachable from the
+last case's failing test too.
+
+**Known limitations** (both about `try`/`except`/`finally`, and both because
+this extractor works at statement/block granularity rather than modeling
+exactly which statement could raise, matching how the C# side's Roslyn-based
+CFG also doesn't add edges for implicit exceptions):
+
+* Every statement in a `try` body is treated as equally able to raise, so a
+  handler is reached by a `condition` edge (naming the exception type, or no
+  condition for a bare `except:`) from the block containing the `try`
+  itself, not from the specific statement that actually raised.
+* `finally` always runs in real Python, including right before an early
+  `return`/`raise`/`break`/`continue` inside the `try` body or a handler —
+  that early-exit path is not routed through `finally` in the CFG, only the
+  normal-completion path is. The `finally` body is still fully present in
+  the graph (via `HAS_FINALLY` on the `Try` statement) either way; only the
+  CFG edge for that specific early-exit timing is the gap.
+
+`for` loops don't carry a `condition` on their branch edges — unlike `if`/
+`while`, there's no boolean test in the source to show (the branch is driven
+by the iterator, not an expression), so showing one would mean fabricating
+text that isn't really there. `with`/`async with` don't branch at all, so
+they don't start a new block; the statement and its body share whatever
+block precedes them.
 
 ## Souffle datalog
 
@@ -210,18 +269,16 @@ Facts and rules are emitted inline, and `.output reachable` / `.output path`
 print the two derived relations when the program runs.
 
 ```datalog
-basic_block("b2", "greet.greet", 0, 1, 0).
-control_flow_edge("b2", "b3", "greet.greet", "(not name)").
-block_statement("b2", "p6", "PythonIfStatement", "greet.greet").
+basic_block("b1", "greet.greet", 0, 1, 0).
+control_flow_edge("b1", "b3", "greet.greet", "not name").
+block_statement("b1", "s1", "PythonIfStatement", "greet.greet").
 
 reachable(Id, Function) :- basic_block(Id, Function, _, 1, _).
 reachable(Target, Function) :- reachable(Source, Function),
                                control_flow_edge(Source, Target, Function, _).
 ```
 
-Python scopes use `module.function` / `module.Class.method`. Note that
-`--souffle` implies the CFG pass, so the extractor also needs
-[`py2cfg`](https://pypi.org/project/py2cfg/) in that mode.
+Python scopes use `module.function` / `module.Class.method`.
 
 ---
 

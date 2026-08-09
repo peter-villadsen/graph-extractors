@@ -46,6 +46,7 @@ LABEL_BY_CLASS = {
     "AsyncWith": "PythonAsyncWithStatement",
     "Raise": "PythonRaiseStatement",
     "Try": "PythonTryStatement",
+    "TryStar": "PythonTryStatement",
     "Assert": "PythonAssertStatement",
     "Import": "PythonImportStatement",
     "ImportFrom": "PythonImportFromStatement",
@@ -142,6 +143,14 @@ _EDGE_BY_FIELD = {
     "type": "OF_TYPE",
 }
 
+# (ast class name, field name) overrides for cases where the generic
+# field-name mapping above would be wrong for that specific class — e.g.
+# ``Dict.values`` is the dict's value expressions, not boolean operands
+# (the generic "values" -> HAS_OPERAND entry exists for ``BoolOp.values``).
+_EDGE_BY_CLASS_FIELD = {
+    ("Dict", "values"): "HAS_VALUE",
+}
+
 # Operator classes we never want as nodes; they are recorded as properties.
 _OP_SYMBOLS = {
     ast.Add: "+",
@@ -187,13 +196,55 @@ _PSEUDO_NODES = {
     "TypeIgnore",
 }
 
+# Comparison operators negate by flipping to their complement, e.g. `<` -> `>=`.
+_COMPARE_NEGATION = {
+    ast.Eq: ast.NotEq,
+    ast.NotEq: ast.Eq,
+    ast.Lt: ast.GtE,
+    ast.LtE: ast.Gt,
+    ast.Gt: ast.LtE,
+    ast.GtE: ast.Lt,
+    ast.Is: ast.IsNot,
+    ast.IsNot: ast.Is,
+    ast.In: ast.NotIn,
+    ast.NotIn: ast.In,
+}
+
 
 def _expr_text(node) -> str:
-    """Render an expression node back to source text."""
+    """Render an expression (or match-case pattern) node back to source text."""
     try:
         return ast.unparse(node)
     except Exception:
         return ast.dump(node)
+
+
+def _negate_condition(node) -> str:
+    """Textual negation of a boolean test, simplified where cheap.
+
+    A single comparison (``a < b``) negates by flipping the operator
+    (``a >= b``); ``not x`` negates by dropping the ``not`` (double-negation
+    elimination). Anything else (chained comparisons, ``and``/``or``, calls,
+    ...) falls back to wrapping the whole test in ``not (...)`` — still a
+    correct negation, just not simplified.
+    """
+    if isinstance(node, ast.Compare) and len(node.ops) == 1:
+        negated_type = _COMPARE_NEGATION.get(type(node.ops[0]))
+        if negated_type is not None:
+            negated = ast.Compare(left=node.left, ops=[negated_type()], comparators=node.comparators)
+            return _expr_text(negated)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return _expr_text(node.operand)
+    return f"not ({_expr_text(node)})"
+
+
+def _is_irrefutable_pattern(pattern) -> bool:
+    """Whether a `match` case pattern always matches (a bare capture/wildcard)."""
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _is_irrefutable_pattern(pattern.pattern)
+    if isinstance(pattern, ast.MatchOr):
+        return any(_is_irrefutable_pattern(p) for p in pattern.patterns)
+    return False
 
 
 def _location_props(node) -> dict:
@@ -209,6 +260,260 @@ def _location_props(node) -> dict:
         if value is not None:
             props[key] = value
     return props
+
+
+class _Block:
+    """One basic block: a straight-line run of statements, in order."""
+
+    __slots__ = ("statements", "reachable")
+
+    def __init__(self):
+        self.statements = []
+        self.reachable = False
+
+
+class _CfgScopeBuilder:
+    """Builds the control-flow graph for one scope (a module, function, or
+    class body) directly from the ``ast``, replacing the third-party
+    ``py2cfg`` package this extractor used to depend on.
+
+    Every scope gets exactly one entry block and one exit block (mirroring
+    how Roslyn's CFG models the C# side of this project); every other block
+    is created only at an actual branch point. Loop targets for `break`/
+    `continue` are tracked on a stack so nested loops resolve correctly.
+    """
+
+    def __init__(self):
+        self.blocks = []
+        self.edges = []  # (source_index, target_index, condition_or_None)
+        self._loop_stack = []  # (continue_target, break_target)
+
+    def new_block(self) -> int:
+        self.blocks.append(_Block())
+        return len(self.blocks) - 1
+
+    def add_edge(self, source, target, condition=None):
+        if source is None or target is None:
+            return
+        self.edges.append((source, target, condition))
+
+    def build(self, body):
+        """Build the CFG for one statement list. Returns ``(entry, exit)``."""
+        entry = self.new_block()
+        exit_ = self.new_block()
+        tail = self._process_body(body, entry, exit_)
+        self.add_edge(tail, exit_)
+        self._mark_reachable(entry)
+        return entry, exit_
+
+    def _mark_reachable(self, entry):
+        adjacency = {}
+        for source, target, _condition in self.edges:
+            adjacency.setdefault(source, []).append(target)
+        seen = set()
+        stack = [entry]
+        while stack:
+            index = stack.pop()
+            if index in seen:
+                continue
+            seen.add(index)
+            stack.extend(adjacency.get(index, []))
+        for index in seen:
+            self.blocks[index].reachable = True
+
+    def _join(self, *exits) -> int | None:
+        """Create an ``after`` block and link every reachable exit into it
+        unconditionally; returns ``None`` if every path already terminated."""
+        live = [e for e in exits if e is not None]
+        if not live:
+            return None
+        after = self.new_block()
+        for block in live:
+            self.add_edge(block, after)
+        return after
+
+    def _process_body(self, stmts, current, scope_exit):
+        for stmt in stmts:
+            if current is None:
+                # Dead code: still gets a block (so it's still represented in
+                # the graph), just with no incoming edge, so `isReachable` is
+                # correctly false for it.
+                current = self.new_block()
+            current = self._process_stmt(stmt, current, scope_exit)
+        return current
+
+    def _process_stmt(self, stmt, current, scope_exit):
+        kind = type(stmt).__name__
+        handler = getattr(self, f"_process_{kind}", None)
+        if handler is not None:
+            return handler(stmt, current, scope_exit)
+        # Every other simple statement (Assign, Expr, Pass, Import, nested
+        # FunctionDef/ClassDef, ...) just joins the current block; flow
+        # continues unchanged.
+        self.blocks[current].statements.append(stmt)
+        return current
+
+    def _process_If(self, stmt, current, scope_exit):
+        self.blocks[current].statements.append(stmt)
+
+        then_block = self.new_block()
+        self.add_edge(current, then_block, _expr_text(stmt.test))
+        then_exit = self._process_body(stmt.body, then_block, scope_exit)
+
+        else_block = self.new_block()
+        self.add_edge(current, else_block, _negate_condition(stmt.test))
+        else_exit = self._process_body(stmt.orelse, else_block, scope_exit)
+
+        return self._join(then_exit, else_exit)
+
+    def _process_loop(self, stmt, current, scope_exit, *, has_condition):
+        """Shared shape for `while` and `for`/`async for`: a test, a body
+        that loops back, an optional `else` (runs only without a `break`),
+        and a shared `after` block that `break` also targets directly."""
+        self.blocks[current].statements.append(stmt)
+
+        body_block = self.new_block()
+        else_block = self.new_block()
+        if has_condition:
+            self.add_edge(current, body_block, _expr_text(stmt.test))
+            self.add_edge(current, else_block, _negate_condition(stmt.test))
+        else:
+            # `for` has no boolean test to show — see README.
+            self.add_edge(current, body_block)
+            self.add_edge(current, else_block)
+
+        after = self.new_block()
+        self._loop_stack.append((current, after))
+        body_exit = self._process_body(stmt.body, body_block, scope_exit)
+        self._loop_stack.pop()
+        self.add_edge(body_exit, current)  # next iteration re-tests
+
+        else_exit = self._process_body(stmt.orelse, else_block, scope_exit)
+        self.add_edge(else_exit, after)
+
+        return after
+
+    def _process_While(self, stmt, current, scope_exit):
+        return self._process_loop(stmt, current, scope_exit, has_condition=True)
+
+    def _process_For(self, stmt, current, scope_exit):
+        return self._process_loop(stmt, current, scope_exit, has_condition=False)
+
+    _process_AsyncFor = _process_For
+
+    def _process_Match(self, stmt, current, scope_exit):
+        self.blocks[current].statements.append(stmt)
+        pending = []
+        test_block = current
+
+        for case in stmt.cases:
+            case_block = self.new_block()
+            condition = _expr_text(case.pattern)
+            if case.guard is not None:
+                condition += f" if {_expr_text(case.guard)}"
+            self.add_edge(test_block, case_block, condition)
+            case_exit = self._process_body(case.body, case_block, scope_exit)
+            if case_exit is not None:
+                pending.append(case_exit)
+
+            if case.guard is None and _is_irrefutable_pattern(case.pattern):
+                # This case always matches: there is no "didn't match" edge
+                # to the next case, or out of the match entirely.
+                test_block = None
+                break
+            next_test = self.new_block()
+            self.add_edge(test_block, next_test, f"not ({condition})")
+            test_block = next_test
+
+        if test_block is not None:
+            # No case matched (not exhaustive): `match` falls through
+            # without running any case body.
+            pending.append(test_block)
+
+        return self._join(*pending)
+
+    def _process_try_like(self, stmt, current, scope_exit):
+        self.blocks[current].statements.append(stmt)
+
+        body_block = self.new_block()
+        self.add_edge(current, body_block)
+        body_exit = self._process_body(stmt.body, body_block, scope_exit)
+
+        # Coarse exception modeling: any statement in the try body might
+        # raise, so each handler is reachable directly from the try's own
+        # block rather than from the exact statement that raised — see
+        # README for the tradeoff.
+        handler_exits = []
+        for handler in stmt.handlers:
+            handler_block = self.new_block()
+            condition = _expr_text(handler.type) if handler.type is not None else None
+            self.add_edge(current, handler_block, condition)
+            handler_exit = self._process_body(handler.body, handler_block, scope_exit)
+            if handler_exit is not None:
+                handler_exits.append(handler_exit)
+
+        if stmt.orelse and body_exit is not None:
+            else_block = self.new_block()
+            self.add_edge(body_exit, else_block)
+            body_exit = self._process_body(stmt.orelse, else_block, scope_exit)
+
+        normal_exits = [e for e in [body_exit, *handler_exits] if e is not None]
+
+        if not stmt.finalbody:
+            return self._join(*normal_exits)
+
+        # Known limitation: `finally` always runs in real Python, including
+        # right before an early `return`/`raise`/`break`/`continue` inside
+        # the try body or a handler — that early-exit path is not routed
+        # through `finally` here, only the normal-completion path is. See
+        # README.
+        finally_block = self.new_block()
+        for exit_block in normal_exits:
+            self.add_edge(exit_block, finally_block)
+        return self._process_body(stmt.finalbody, finally_block, scope_exit)
+
+    _process_Try = _process_try_like
+    _process_TryStar = _process_try_like
+
+    def _process_With(self, stmt, current, scope_exit):
+        # `with`/`async with` don't branch; the statement joins the current
+        # block and its body is processed in the same flow (no new block).
+        self.blocks[current].statements.append(stmt)
+        return self._process_body(stmt.body, current, scope_exit)
+
+    _process_AsyncWith = _process_With
+
+    def _process_Return(self, stmt, current, scope_exit):
+        self.blocks[current].statements.append(stmt)
+        self.add_edge(current, scope_exit)
+        return None
+
+    _process_Raise = _process_Return
+
+    def _process_Break(self, stmt, current, scope_exit):
+        self.blocks[current].statements.append(stmt)
+        if self._loop_stack:
+            self.add_edge(current, self._loop_stack[-1][1])
+        return None
+
+    def _process_Continue(self, stmt, current, scope_exit):
+        self.blocks[current].statements.append(stmt)
+        if self._loop_stack:
+            self.add_edge(current, self._loop_stack[-1][0])
+        return None
+
+
+def _iter_scopes(node, qualname):
+    """Yield ``(qualname, body)`` for ``node``'s own body (if it has one) and
+    recurse into every nested function/class definition's body, building
+    dotted qualnames (``module.Class.method``) as it goes."""
+    body = getattr(node, "body", None)
+    if body is None:
+        return
+    yield qualname, body
+    for stmt in body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield from _iter_scopes(stmt, f"{qualname}.{stmt.name}")
 
 
 class GraphBuilder:
@@ -237,100 +542,79 @@ class GraphBuilder:
         self._attach_comments()
         return self._nodes, self._relationships
 
-    # -- control flow graph (py2cfg) ---------------------------------
+    # -- control flow graph --------------------------------------------
 
     def build_cfg(self, tree):
-        """Emit basic blocks and control-flow edges computed by ``py2cfg``.
+        """Build and emit control-flow graphs for the module and every
+        nested function/class body: one ``PythonBasicBlock`` per basic
+        block, ``FOLLOWS`` edges for the successor graph (with branch
+        conditions where the branch is a real boolean test), and
+        ``CONTAINS`` links from each block to the statements it executes.
 
-        The CFG is calculated by the ``py2cfg`` package (a third-party AST
-        walker), not by this extractor; we only render its blocks and links
-        into the graph. ``py2cfg`` is an optional dependency and is imported
-        lazily so the extractor stays stdlib-only without ``--cfg``.
+        Computed entirely with the standard library — no third-party
+        dependency, unlike the CFG pass this extractor used to hand off to
+        the (unmaintained, `match`-statement-unaware) `py2cfg` package.
         """
-        try:
-            from py2cfg.builder import CFGBuilder
-        except ImportError:
-            raise RuntimeError("the '--cfg' flag requires the 'py2cfg' package (pip install py2cfg)")
-
         module_name = os.path.splitext(os.path.basename(self._filename))[0] or "module"
-        try:
-            cfg = CFGBuilder().build(module_name, tree)
-            self._cfg_blocks = []
-            self._cfg_edges = []
-            self._emit_cfg_tree(cfg, module_name)
-        except Exception as exc:
-            # py2cfg is a third-party AST walker with its own edge cases
-            # (e.g. it has no visitor for `match`); let a single file's CFG
-            # failure be reported and skipped rather than crashing the whole
-            # run.
-            raise RuntimeError(f"py2cfg failed to build a control-flow graph: {exc}") from exc
+        self._cfg_blocks = []
+        self._cfg_edges = []
+        for qualname, body in _iter_scopes(tree, module_name):
+            self._emit_cfg_scope(qualname, body)
 
-    def _emit_cfg_tree(self, cfg, qualname):
-        """Emit one CFG and recurse into function/class sub-CFGs."""
-        self._emit_cfg(cfg, qualname)
-        for child_name, sub in cfg.functioncfgs.items():
-            self._emit_cfg_tree(sub, f"{qualname}.{child_name}")
-        for child_name, sub in cfg.classcfgs.items():
-            self._emit_cfg_tree(sub, f"{qualname}.{child_name}")
+    def _emit_cfg_scope(self, qualname, body):
+        builder = _CfgScopeBuilder()
+        entry, exit_ = builder.build(body)
 
-    def _emit_cfg(self, cfg, qualname):
-        """Collect one py2cfg graph into the model; emit Cypher nodes/edges."""
-        blocks = list(cfg.own_blocks())
         block_nodes = {}
-        for ordinal, block in enumerate(blocks):
+        for ordinal, block in enumerate(builder.blocks):
             first = block.statements[0] if block.statements else None
+            last = block.statements[-1] if block.statements else None
             props = {
                 "scope": qualname,
                 "ordinal": ordinal,
-                "blockId": block.id,
-                "isEntry": block is cfg.entryblock,
-                "isFinal": block in cfg.finalblocks,
+                "blockId": ordinal,
+                "isEntry": ordinal == entry,
+                "isFinal": ordinal == exit_,
+                "isReachable": block.reachable,
             }
             if first is not None:
                 props["kind"] = type(first).__name__
-            start, end = block.at(), block.end()
-            if start >= 0:
-                props["startLine"] = start
-            if end >= 0:
-                props["endLine"] = end
-            block_nodes[block.id] = self._add_node("PythonBasicBlock", props)
+                if getattr(first, "lineno", None) is not None:
+                    props["startLine"] = first.lineno
+            if last is not None and getattr(last, "end_lineno", None) is not None:
+                props["endLine"] = last.end_lineno
+            block_nodes[ordinal] = self._add_node("PythonBasicBlock", props)
 
+        for ordinal, block in enumerate(builder.blocks):
+            block_id = block_nodes[ordinal]
             statement_ids = []
-            for stmt in block.statements:
+            for stmt_ordinal, stmt in enumerate(block.statements):
                 stmt_id = self._node_ids.get(id(stmt))
                 if stmt_id is not None:
                     statement_ids.append(stmt_id)
-                    self._rel(block_nodes[block.id], "CONTAINS", stmt_id)
+                    self._rel(block_id, "CONTAINS", stmt_id, {"ordinal": stmt_ordinal})
             self._cfg_blocks.append(
                 {
-                    "id": block_nodes[block.id],
+                    "id": block_id,
                     "function": qualname,
                     "ordinal": ordinal,
-                    "isEntry": block is cfg.entryblock,
-                    "isFinal": block in cfg.finalblocks,
+                    "isEntry": ordinal == entry,
+                    "isFinal": ordinal == exit_,
                     "statementIds": statement_ids,
                 }
             )
 
-        for block in blocks:
-            source = block_nodes[block.id]
-            for link in block.exits:
-                target = block_nodes.get(link.target.id)
-                if target is None:
-                    continue
-                properties = None
-                condition = link.get_exitcase().strip()
-                if condition:
-                    properties = {"condition": condition}
-                self._rel(source, "FOLLOWS", target, properties)
-                self._cfg_edges.append(
-                    {
-                        "source": source,
-                        "target": target,
-                        "function": qualname,
-                        "condition": condition,
-                    }
-                )
+        for source, target, condition in builder.edges:
+            properties = {"condition": condition} if condition else None
+            self._rel(block_nodes[source], "FOLLOWS", block_nodes[target], properties)
+            self._cfg_edges.append(
+                {
+                    "source": block_nodes[source],
+                    "target": block_nodes[target],
+                    "function": qualname,
+                    "condition": condition,
+                }
+            )
 
     def _new_id(self) -> str:
         self._counter += 1
@@ -483,19 +767,45 @@ class GraphBuilder:
     def _visit_children(self, node, node_id):
         if self._visit_special(node, node_id):
             return
+        class_name = type(node).__name__
+        counters = {}
         for field in node._fields:
             if field in _SKIP_FIELDS:
                 continue
             value = getattr(node, field, None)
             if value is None:
                 continue
-            edge = _EDGE_BY_FIELD.get(field, "HAS_" + field.upper())
+            edge = _EDGE_BY_CLASS_FIELD.get((class_name, field)) or _EDGE_BY_FIELD.get(
+                field, "HAS_" + field.upper()
+            )
             if self._is_node(value):
-                self._visit(value, edge, node_id)
+                self._visit_ordered(value, edge, node_id, counters)
             elif isinstance(value, list):
                 for item in value:
                     if self._is_node(item):
-                        self._visit(item, edge, node_id)
+                        self._visit_ordered(item, edge, node_id, counters)
+
+    def _visit_ordered(self, child, edge, node_id, counters):
+        """Visits ``child`` and links it to ``node_id`` with an ``ordinal``
+        tracking its position among same-typed siblings from this parent —
+        across all fields sharing that edge type, so e.g. ``BinOp``'s
+        separate ``left``/``right`` fields (both HAS_OPERAND) still get 0/1
+        in source order. Statement children are additionally chained with
+        ``FOLLOWS`` in source order, matching the C# extractor.
+        """
+        ordinal = counters.get(edge, 0)
+        counters[edge] = ordinal + 1
+        child_id = self._visit(child, None, None)
+        if child_id is None:
+            return None
+        self._rel(node_id, edge, child_id, {"ordinal": ordinal})
+        if isinstance(child, ast.stmt):
+            previous_key = (edge, "previous")
+            previous_id = counters.get(previous_key)
+            if previous_id is not None:
+                self._rel(previous_id, "FOLLOWS", child_id)
+            counters[previous_key] = child_id
+        return child_id
 
     @staticmethod
     def _is_node(value) -> bool:
@@ -506,16 +816,17 @@ class GraphBuilder:
     def _visit_special(self, node, node_id) -> bool:
         """Handle node types whose children need bespoke edges."""
         class_name = type(node).__name__
+        counters = {}
 
         if class_name in ("FunctionDef", "AsyncFunctionDef"):
             for dec in node.decorator_list:
-                self._visit(dec, "HAS_DECORATOR", node_id)
+                self._visit_ordered(dec, "HAS_DECORATOR", node_id, counters)
             self._visit(node.args, "HAS_PARAMETER", node_id)
             if node.returns is not None:
                 type_id = self._add_type_node(_expr_text(node.returns))
                 self._rel(node_id, "RETURNS", type_id)
             for stmt in node.body:
-                self._visit(stmt, "CONTAINS", node_id)
+                self._visit_ordered(stmt, "CONTAINS", node_id, counters)
             return True
 
         if class_name == "Lambda":
@@ -533,9 +844,9 @@ class GraphBuilder:
                 if kw.value is not None:
                     self._visit(kw.value, "HAS_VALUE", kw_id)
             for dec in node.decorator_list:
-                self._visit(dec, "HAS_DECORATOR", node_id)
+                self._visit_ordered(dec, "HAS_DECORATOR", node_id, counters)
             for stmt in node.body:
-                stmt_id = self._visit(stmt, "CONTAINS", node_id)
+                stmt_id = self._visit_ordered(stmt, "CONTAINS", node_id, counters)
                 if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     self._rel(node_id, "DECLARES", stmt_id)
             return True
@@ -549,15 +860,21 @@ class GraphBuilder:
         return False
 
     def _visit_arguments(self, arguments, edge, parent_id):
-        """Attach parameters (and their defaults/annotations) to a callable."""
+        """Attach parameters (and their defaults/annotations) to a callable,
+        each with an ``ordinal`` reflecting calling-convention order
+        (positional-only, positional, ``*args``, keyword-only, ``**kwargs``).
+        """
+        ordinal = 0
 
         def visit_arg(arg_node, kind, default=None):
+            nonlocal ordinal
             if arg_node is None:
                 return None
             props = {"name": arg_node.arg, "kind": kind}
             props.update(_location_props(arg_node))
             node_id = self._add_node("PythonParameter", props)
-            self._rel(parent_id, edge, node_id)
+            self._rel(parent_id, edge, node_id, {"ordinal": ordinal})
+            ordinal += 1
             if default is not None:
                 default_id = self._visit(default, None, None)
                 self._rel(node_id, "HAS_DEFAULT", default_id)
@@ -611,7 +928,7 @@ class GraphBuilder:
     def _nearest_statement(line, lines):
         if not lines:
             return None
-        index = bisect.bisect_right(lines, (line, "\uffff"))
+        index = bisect.bisect_right(lines, (line, "￿"))
         if index > 0:
             return lines[index - 1][1]
         return None
