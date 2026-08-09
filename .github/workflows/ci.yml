@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  csharp-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet test csharp/CSharpToCypher.Tests/CSharpToCypher.Tests.csproj
+
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+        working-directory: python
+
+  # End-to-end check that --format csv's output actually loads into a real
+  # Neo4j: generates CSVs from each extractor's sample file, runs the exact
+  # `neo4j-admin database import` command the tool prints (in Docker, since
+  # neo4j-admin isn't installed on the runner), and queries the resulting
+  # database to confirm the node/relationship counts match the CSVs. See
+  # scripts/verify-neo4j-import.sh for why this exists.
+  neo4j-import:
+    runs-on: ubuntu-latest
+    needs: [csharp-tests, python-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: dotnet build csharp/CSharpToCypher/CSharpToCypher.csproj -c Release
+      - run: docker pull neo4j:5-community
+      - name: Verify C# extractor's neo4j-admin import
+        run: |
+          bash scripts/verify-neo4j-import.sh csharp csharp/samples/sample.cs \
+            dotnet csharp/CSharpToCypher/bin/Release/net8.0/CSharpToCypher.dll
+      - name: Verify Python extractor's neo4j-admin import
+        run: |
+          bash scripts/verify-neo4j-import.sh python python/samples/sample.py \
+            python -m python.cypher_extractor

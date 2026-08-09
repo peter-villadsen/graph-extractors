@@ -64,3 +64,19 @@ so adding a third output format only means adding one more implementation.
 Each language's README has the full reference: requirements, CLI flags and
 what they mean, node/relationship label tables, control-flow-graph details,
 and Souffle datalog output.
+
+## CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and
+pull request against `main`:
+
+* `csharp-tests` / `python-tests` — the two unit test suites.
+* `neo4j-import` — an end-to-end check that `--format csv`'s output actually
+  loads into a real Neo4j: generates CSVs from each extractor's sample file,
+  runs the *exact* `neo4j-admin database import` command the tool prints
+  against a real `neo4j:5-community` container (Docker is preinstalled on the
+  runner), and queries the resulting database to confirm the node/relationship
+  counts match the CSVs. See [`scripts/verify-neo4j-import.sh`](scripts/verify-neo4j-import.sh)
+  — it exists because two real bugs (the `<database>` argument's position,
+  and a CSV column typed from only its first value) made it past the unit
+  tests and were only caught by actually running the printed command.
