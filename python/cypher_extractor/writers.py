@@ -48,18 +48,28 @@ def _infer_type(value) -> str:
     return "string"
 
 
-def _format_csv_value(value, neo4j_type: str) -> str:
+def _format_csv_value(value) -> str:
+    """Render by the value's own type, independent of the column's declared
+    (possibly downgraded-to-string) type -- a "string" column still needs
+    "true"/"false" for a bool, not str()'s "True"/"False".
+    """
     if value is None:
         return ""
-    if neo4j_type == "boolean":
+    if isinstance(value, bool):
         return "true" if value else "false"
-    if neo4j_type == "string[]":
+    if isinstance(value, (list, tuple)):
         return _ARRAY_DELIMITER.join("" if v is None else str(v) for v in value)
     return str(value)
 
 
 def _collect_schema(rows):
-    """Union of property keys across every row in a group, in first-seen order, with a Neo4j type per key inferred from its first non-null value."""
+    """Union of property keys across every row in a group, in first-seen order,
+    with a Neo4j type per key inferred from its values. A property whose type
+    varies from row to row (e.g. ``ast.Constant.value``, which is sometimes an
+    int, sometimes a string) falls back to "string" -- the one type every
+    value can be rendered as -- rather than emitting a column whose declared
+    type doesn't match every row, which neo4j-admin rejects outright.
+    """
     columns = []
     seen = set()
     types = {}
@@ -70,7 +80,12 @@ def _collect_schema(rows):
             if key not in seen:
                 seen.add(key)
                 columns.append(key)
-            types.setdefault(key, _infer_type(value))
+            inferred = _infer_type(value)
+            existing = types.get(key)
+            if existing is None:
+                types[key] = inferred
+            elif existing != inferred:
+                types[key] = "string"
     return columns, types
 
 
@@ -141,7 +156,7 @@ class Neo4jAdminImportWriter:
             writer.writerow([":ID", ":LABEL"] + _header_names(columns, types))
             for node in nodes:
                 row = [node.id, _ARRAY_DELIMITER.join(node.labels)]
-                row += [_format_csv_value(node.properties.get(key), types[key]) for key in columns]
+                row += [_format_csv_value(node.properties.get(key)) for key in columns]
                 writer.writerow(row)
         return path
 
@@ -157,13 +172,17 @@ class Neo4jAdminImportWriter:
             writer.writerow([":START_ID", ":END_ID"] + _header_names(columns, types))
             for relationship in relationships:
                 row = [relationship.source, relationship.target]
-                row += [_format_csv_value(relationship.properties.get(key), types[key]) for key in columns]
+                row += [_format_csv_value(relationship.properties.get(key)) for key in columns]
                 writer.writerow(row)
         return path
 
     def _build_command(self, node_paths, relationship_paths) -> str:
-        parts = ["neo4j-admin", "database", "import", "full", "--multiline-fields=true"]
+        # <database> must come right after 'full', not at the end (even though
+        # that's the order --help shows): neo4j-admin's --nodes/--relationships
+        # are unbounded multi-valued options, so a trailing bare "neo4j" gets
+        # parsed as one more file in the last --relationships list instead of
+        # the positional database argument, and the import fails outright.
+        parts = ["neo4j-admin", "database", "import", "full", self._database, "--multiline-fields=true"]
         parts += [f"--nodes={_quote_arg(path)}" for path in node_paths]
         parts += [f"--relationships={rel_type}={_quote_arg(path)}" for rel_type, path in relationship_paths]
-        parts.append(self._database)
         return " ".join(parts)

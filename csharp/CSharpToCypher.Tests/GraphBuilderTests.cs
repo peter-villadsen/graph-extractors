@@ -785,8 +785,10 @@ public class Neo4jAdminImportWriterTests : IDisposable
         Assert.Equal(new[] { "n3", "CSharpCompilationUnit", "m.cs" }, files["CSharpCompilationUnit.csv"][1]);
 
         Assert.Contains("--nodes=", command);
-        Assert.Contains("neo4j-admin database import full", command);
-        Assert.EndsWith(" neo4j", command.TrimEnd());
+        // <database> must come right after 'full' -- neo4j-admin's --relationships
+        // is an unbounded multi-valued option, so a trailing bare "neo4j" would be
+        // parsed as one more file in that list instead of the database argument.
+        Assert.Contains("neo4j-admin database import full neo4j --multiline-fields=true", command);
     }
 
     [Fact]
@@ -845,5 +847,24 @@ public class Neo4jAdminImportWriterTests : IDisposable
         var rows = files["CSharpClassDeclaration.csv"];
         Assert.Equal(new[] { ":ID", ":LABEL", "typeParameters:string[]" }, rows[0]);
         Assert.Equal(new[] { "n1", "CSharpClassDeclaration", "T;U" }, rows[1]);
+    }
+
+    [Fact]
+    public void Property_with_mixed_types_across_rows_falls_back_to_string()
+    {
+        // A column typed from only the first row (e.g. "value:long") would make
+        // neo4j-admin reject every later row whose value isn't an integer.
+        var document = new CypherDocument();
+        document.Nodes.Add(MakeNode("n1", new[] { "CSharpEnumMember" }, new() { ["value"] = 1L }));
+        document.Nodes.Add(MakeNode("n2", new[] { "CSharpEnumMember" }, new() { ["value"] = "is" }));
+        document.Nodes.Add(MakeNode("n3", new[] { "CSharpEnumMember" }, new() { ["value"] = true }));
+
+        var (files, _) = Run(document);
+
+        var rows = files["CSharpEnumMember.csv"];
+        Assert.Equal(new[] { ":ID", ":LABEL", "value" }, rows[0]);
+        Assert.Equal(new[] { "n1", "CSharpEnumMember", "1" }, rows[1]);
+        Assert.Equal(new[] { "n2", "CSharpEnumMember", "is" }, rows[2]);
+        Assert.Equal(new[] { "n3", "CSharpEnumMember", "true" }, rows[3]);
     }
 }

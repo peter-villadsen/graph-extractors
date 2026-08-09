@@ -616,8 +616,10 @@ class Neo4jAdminImportWriterTests(unittest.TestCase):
         self.assertEqual(files["PythonModule.csv"][1], ["p3", "PythonModule", "m.py"])
 
         self.assertIn("--nodes=", command)
-        self.assertIn("neo4j-admin database import full", command)
-        self.assertTrue(command.rstrip().endswith("neo4j"))
+        # <database> must come right after 'full' -- neo4j-admin's --relationships
+        # is an unbounded multi-valued option, so a trailing bare "neo4j" would be
+        # parsed as one more file in that list instead of the database argument.
+        self.assertIn("neo4j-admin database import full neo4j --multiline-fields=true", command)
 
     def test_missing_property_renders_as_empty_field(self):
         nodes = [
@@ -658,6 +660,23 @@ class Neo4jAdminImportWriterTests(unittest.TestCase):
         rows = files["PythonFunctionDefinition.csv"]
         self.assertEqual(rows[0], [":ID", ":LABEL", "typeParameters:string[]"])
         self.assertEqual(rows[1], ["p1", "PythonFunctionDefinition", "T;U"])
+
+    def test_property_with_mixed_types_across_rows_falls_back_to_string(self):
+        # ast.Constant.value is int for one literal, str for another -- a real
+        # occurrence, not a contrived one. A column typed from only the first
+        # row (e.g. "value:long") would make neo4j-admin reject every later
+        # row whose value isn't an integer.
+        nodes = [
+            Node("p1", "PythonConstant", {"value": 1}),
+            Node("p2", "PythonConstant", {"value": "is"}),
+            Node("p3", "PythonConstant", {"value": True}),
+        ]
+        files, _ = self._run(nodes, [])
+        rows = files["PythonConstant.csv"]
+        self.assertEqual(rows[0], [":ID", ":LABEL", "value"])
+        self.assertEqual(rows[1], ["p1", "PythonConstant", "1"])
+        self.assertEqual(rows[2], ["p2", "PythonConstant", "is"])
+        self.assertEqual(rows[3], ["p3", "PythonConstant", "true"])
 
 
 if __name__ == "__main__":
