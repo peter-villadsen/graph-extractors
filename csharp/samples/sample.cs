@@ -98,6 +98,14 @@ public struct Point
 
 public static class Helpers
 {
+    /// <summary>Calls into declarations elsewhere in this file, so CALLS edges land on declaration nodes.</summary>
+    public static string Introduce(string name)
+    {
+        var dog = new Dog(name);
+        dog.Fly();
+        return dog.Speak() + ", " + dog.Describe();
+    }
+
     public static T FirstOrDefault<T>(this IEnumerable<T> source, Func<T, bool> predicate)
     {
         foreach (var item in source)

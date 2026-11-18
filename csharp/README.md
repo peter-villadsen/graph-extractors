@@ -165,7 +165,39 @@ declarators, so `int a, b;` gives two declarators named `…a` and `…b`.
 (:CSharpQueryClause)-[:HAS_ORDERING]->(:CSharpOrdering)        -- orderby clause
 (:CSharpTryStatement)-[:HAS_CATCH]->(:CSharpCatchClause)
 (:CSharpNode)-[:HAS_TRIVIA]->(:CSharpTrivia)
+(:CSharpDeclaration)-[:CALLS {count}]->(:CSharpDeclaration|:CSharpSymbol) -- resolved callee, see below
 ```
+
+### `CALLS`
+
+Each invocation (`M()`, `x.M()`) and object creation (`new Foo()`) adds a
+call site from the innermost enclosing method-like node (method, constructor,
+accessor, operator, local function, lambda or anonymous method) to the
+resolved callee. Once every input file is built, call sites are grouped into
+one `CALLS` edge per (caller, callee) pair, with `count` = the number of call
+sites. The edge targets:
+
+* the callee's **declaration node** when the callee is declared anywhere in
+  the input, **including another file** of the same run;
+* otherwise one shared `CSharpSymbol` node (`symbolName`, `symbolKind`) per
+  external callee, deduplicated across the whole run (e.g. a single
+  `System.Console.WriteLine(string)` node for every file that calls it).
+
+Callees are matched by symbol identity, never by name, after normalizing:
+a generic method or a member of a generic type maps to its definition
+(`Id<int>` and `Id<string>` both reach `Id<T>`), an extension method called
+with instance syntax maps to its static declaration, and a partial method
+maps to its implementation part. A callee with no source declaration — an
+implicit default constructor, a record's primary constructor — gets a
+`CSharpSymbol` node.
+
+> **Behavior change:** `CALLS` used to point at a `CSharpSymbol` node created
+> per file, with one edge per call site. It now targets the callee's
+> declaration node whenever the callee is in the input, carries a `count`,
+> and connects calls across files. Queries that matched
+> `(:CSharpDeclaration)-[:CALLS]->(:CSharpSymbol)` for in-source callees should
+> match the declaration instead, e.g.
+> `MATCH (caller)-[c:CALLS]->(m:CSharpMethodDeclaration {name: 'Fly'}) RETURN caller, c.count`.
 
 ---
 

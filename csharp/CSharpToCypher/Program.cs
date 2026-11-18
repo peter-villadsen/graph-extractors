@@ -142,12 +142,14 @@ internal static class Program
         IGraphWriter writer = format == "csv"
             ? new Neo4jAdminImportWriter(outputDir, database, Console.Out)
             : new CypherStreamWriter(Console.Out);
+        // Shared by every file's builder so CALLS edges resolve across files.
+        var registry = new SymbolRegistry();
         var nextId = 0;
         foreach (var (file, tree) in trees)
         {
             var root = (CompilationUnitSyntax)tree.GetRoot();
             var model = compilation.GetSemanticModel(tree);
-            var builder = new GraphBuilder(file, model, nextId);
+            var builder = new GraphBuilder(file, model, nextId, registry);
             var document = builder.Build(root);
             nextId = builder.Counter;
 
@@ -171,6 +173,14 @@ internal static class Program
         }
         else
         {
+            // Every declaration in the run is known now, so call sites can be
+            // resolved to declaration nodes, including ones in other files.
+            var calls = registry.BuildCallDocument(nextId, out nextId);
+            if (verbose)
+            {
+                Console.Error.WriteLine($"[verbose] calls: {calls.Nodes.Count} external symbols, {calls.Relationships.Count} CALLS edges");
+            }
+            writer.Write(calls);
             writer.Finish();
         }
 

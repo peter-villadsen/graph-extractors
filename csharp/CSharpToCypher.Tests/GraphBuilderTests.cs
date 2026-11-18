@@ -33,17 +33,38 @@ public class GraphBuilderTests
         return new GraphBuilder(file).Build(root);
     }
 
-    private static CypherDocument BuildWithModel(string source, string file = "test.cs")
+    private static CypherDocument BuildWithModel(string source, string file = "test.cs") =>
+        BuildRun((file, source));
+
+    /// <summary>
+    /// Builds several files the way <c>Program</c> does: one compilation, one
+    /// shared <see cref="SymbolRegistry"/>, run-global ids, and the final call
+    /// document appended after every file. Returns everything merged.
+    /// </summary>
+    private static CypherDocument BuildRun(params (string File, string Source)[] files)
     {
-        var tree = (CSharpSyntaxTree)CSharpSyntaxTree.ParseText(source, path: file);
+        var trees = files.Select(f => CSharpSyntaxTree.ParseText(f.Source, path: f.File)).ToList();
         var references = ((string?)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES"))
             ?.Split(Path.PathSeparator)
             .Where(p => !string.IsNullOrEmpty(p) && File.Exists(p))
             .Select(p => (MetadataReference)MetadataReference.CreateFromFile(p))
             .ToArray() ?? Array.Empty<MetadataReference>();
-        var compilation = CSharpCompilation.Create("Test", new[] { tree }, references);
-        var model = compilation.GetSemanticModel(tree);
-        return new GraphBuilder(file, model).Build((CompilationUnitSyntax)tree.GetRoot());
+        var compilation = CSharpCompilation.Create("Test", trees, references);
+        var registry = new SymbolRegistry();
+        var merged = new CypherDocument();
+        var nextId = 0;
+        for (var i = 0; i < trees.Count; i++)
+        {
+            var builder = new GraphBuilder(files[i].File, compilation.GetSemanticModel(trees[i]), nextId, registry);
+            var document = builder.Build((CompilationUnitSyntax)trees[i].GetRoot());
+            nextId = builder.Counter;
+            merged.Nodes.AddRange(document.Nodes);
+            merged.Relationships.AddRange(document.Relationships);
+        }
+        var calls = registry.BuildCallDocument(nextId, out _);
+        merged.Nodes.AddRange(calls.Nodes);
+        merged.Relationships.AddRange(calls.Relationships);
+        return merged;
     }
 
     [Fact]
@@ -236,26 +257,90 @@ public class GraphBuilderTests
         var methodA = doc.Nodes.First(n =>
             n.Labels.Contains("CSharpMethodDeclaration") && n.Properties["name"] as string == "A");
 
+        var methodB = doc.Nodes.First(n =>
+            n.Labels.Contains("CSharpMethodDeclaration") && n.Properties["name"] as string == "B");
+
+        // Behavior change (#3): a callee declared in the input is reached at its
+        // declaration node, not at a per-file CSharpSymbol node.
         var calls = doc.Relationships.Where(r => r.Type == "CALLS").ToList();
         Assert.Single(calls);
         Assert.Equal(methodA.Id, calls[0].Source);
-
-        var callee = doc.Nodes.First(n => n.Id == calls[0].Target);
-        Assert.Equal("CSharpSymbol", callee.Labels[0]);
-        Assert.Equal("Method", callee.Properties["symbolKind"]);
-        Assert.Equal("C.B()", callee.Properties["symbolName"]);
+        Assert.Equal(methodB.Id, calls[0].Target);
+        Assert.DoesNotContain(doc.Nodes, n => n.Labels.Contains("CSharpSymbol"));
     }
 
     [Fact]
-    public void Repeated_calls_to_same_symbol_share_one_callee_node()
+    public void Repeated_calls_to_same_symbol_share_one_edge_with_count()
     {
-        var doc = BuildWithModel("class C { void A() { B(); B(); B(); } void B() { } }");
-        var calls = doc.Relationships.Where(r => r.Type == "CALLS").ToList();
-        Assert.Equal(3, calls.Count);
-        Assert.Single(calls.Select(c => c.Target).Distinct());
+        // Behavior change (#3): one CALLS edge per (caller, callee) pair with a
+        // count, instead of one edge per call site.
+        var doc = BuildWithModel("class C { void A() { B(); B(); } void B() { } }");
+        var call = Assert.Single(doc.Relationships, r => r.Type == "CALLS");
+        Assert.Equal(2, call.Properties!["count"]);
+    }
 
-        var calleeNodes = doc.Nodes.Where(n => n.Labels.Contains("CSharpSymbol")).ToList();
-        Assert.Single(calleeNodes);
+    private static CypherNode CallTarget(CypherDocument doc, CypherNode caller) =>
+        doc.Nodes.Single(n => n.Id == Assert.Single(doc.Relationships, r => r.Source == caller.Id && r.Type == "CALLS").Target);
+
+    private static CypherNode Method(CypherDocument doc, string name) =>
+        doc.Nodes.Single(n => n.Labels.Contains("CSharpMethodDeclaration") && n.Properties["name"] as string == name);
+
+    [Fact]
+    public void Call_to_method_in_another_file_targets_its_declaration()
+    {
+        var doc = BuildRun(
+            ("a.cs", "class A { void Caller() { new B().Callee(); } }"),
+            ("b.cs", "class B { public void Callee() { } }"));
+        var callee = Method(doc, "Callee");
+        Assert.Contains(doc.Relationships, r =>
+            r.Source == Method(doc, "Caller").Id && r.Type == "CALLS" && r.Target == callee.Id);
+    }
+
+    [Fact]
+    public void Generic_method_calls_with_different_type_arguments_target_the_definition()
+    {
+        var doc = BuildRun(("g.cs", "class G { static T Id<T>(T x) => x; void M() { Id(1); Id(\"s\"); } }"));
+        var call = Assert.Single(doc.Relationships, r => r.Source == Method(doc, "M").Id && r.Type == "CALLS");
+        Assert.Equal(Method(doc, "Id").Id, call.Target);
+        Assert.Equal(2, call.Properties!["count"]);
+    }
+
+    [Fact]
+    public void External_callee_from_two_files_shares_one_symbol_node()
+    {
+        var doc = BuildRun(
+            ("a.cs", "class A { void M() { System.Console.WriteLine(1); } }"),
+            ("b.cs", "class B { void M() { System.Console.WriteLine(2); } }"));
+        var symbol = Assert.Single(doc.Nodes, n => n.Labels.Contains("CSharpSymbol"));
+        Assert.Equal("System.Console.WriteLine(int)", symbol.Properties["symbolName"]);
+        Assert.Equal("Method", symbol.Properties["symbolKind"]);
+        Assert.Equal(2, doc.Relationships.Count(r => r.Type == "CALLS" && r.Target == symbol.Id));
+    }
+
+    [Fact]
+    public void Constructor_call_targets_the_constructor_declaration()
+    {
+        var doc = BuildRun(("f.cs", "class Foo { public Foo() { } } class U { void M() { new Foo(); } }"));
+        var ctor = Assert.Single(doc.Nodes, n => n.Labels.Contains("CSharpConstructorDeclaration"));
+        Assert.Equal(ctor.Id, CallTarget(doc, Method(doc, "M")).Id);
+    }
+
+    [Fact]
+    public void Extension_method_called_with_instance_syntax_targets_the_static_declaration()
+    {
+        var doc = BuildRun(
+            ("ext.cs", "static class Ext { public static int Twice(this int x) => x * 2; }"),
+            ("use.cs", "class U { int M() => 3.Twice(); }"));
+        Assert.Equal(Method(doc, "Twice").Id, CallTarget(doc, Method(doc, "M")).Id);
+    }
+
+    [Fact]
+    public void Call_to_partial_method_targets_its_implementation_part()
+    {
+        var doc = BuildRun(("p.cs", "partial class P { partial void Hook(); partial void Hook() { } void M() { Hook(); } }"));
+        var parts = doc.Nodes.Where(n => n.Labels.Contains("CSharpMethodDeclaration") && n.Properties["name"] as string == "Hook").ToList();
+        Assert.Equal(2, parts.Count);
+        Assert.Equal(parts[1].Id, CallTarget(doc, Method(doc, "M")).Id);
     }
 
     [Fact]

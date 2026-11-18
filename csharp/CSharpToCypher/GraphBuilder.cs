@@ -22,22 +22,29 @@ public sealed class GraphBuilder
     private readonly string _file;
     private readonly SemanticModel? _model;
     private readonly Dictionary<SyntaxNode, string> _nodeIds = new();
-    private readonly Dictionary<ISymbol, string> _symbolNodeIds = new(SymbolEqualityComparer.Default);
+    private readonly SymbolRegistry _registry;
     private readonly Stack<string> _methodStack = new();
     private int _counter;
 
     /// <summary>Includes containing type/namespace so symbol names are unambiguous.</summary>
-    private static readonly SymbolDisplayFormat QualifiedFormat = new(
+    internal static readonly SymbolDisplayFormat QualifiedFormat = new(
         typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
         memberOptions: SymbolDisplayMemberOptions.IncludeContainingType | SymbolDisplayMemberOptions.IncludeParameters,
         parameterOptions: SymbolDisplayParameterOptions.IncludeType,
         miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes | SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers);
 
-    public GraphBuilder(string file, SemanticModel? model = null, int startId = 0)
+    /// <param name="registry">
+    /// The run-wide registry that collects declarations and call sites so
+    /// <c>CALLS</c> edges can be resolved across files once every file is built
+    /// (see <see cref="SymbolRegistry.BuildCallDocument"/>). Without one, the
+    /// builder uses a private registry and its call sites are never emitted.
+    /// </param>
+    public GraphBuilder(string file, SemanticModel? model = null, int startId = 0, SymbolRegistry? registry = null)
     {
         _file = file;
         _model = model;
         _counter = startId;
+        _registry = registry ?? new SymbolRegistry();
     }
 
     /// <summary>The id counter after the last <see cref="Build"/> call, so the next file in a multi-file run can continue it and keep node ids unique across the whole run.</summary>
@@ -247,7 +254,21 @@ public sealed class GraphBuilder
     }
 
     private string CreateDeclarationNode(SyntaxNode syntax, string specific, IEnumerable<KeyValuePair<string, object?>> props)
-        => CreateNode(syntax, new[] { specific, "CSharpDeclaration" }, props.Concat(DeclaredSymbolProps(syntax)));
+    {
+        var id = CreateNode(syntax, new[] { specific, "CSharpDeclaration" }, props.Concat(DeclaredSymbolProps(syntax)));
+        RegisterDeclaration(syntax, id);
+        return id;
+    }
+
+    /// <summary>Tells the run-wide registry that node <paramref name="id"/> declares the symbol of <paramref name="syntax"/>, so calls to it (from any file) can target this node.</summary>
+    private void RegisterDeclaration(SyntaxNode syntax, string id)
+    {
+        var symbol = _model?.GetDeclaredSymbol(syntax);
+        if (symbol is not null)
+        {
+            _registry.RegisterDeclaration(symbol, id);
+        }
+    }
 
     /// <summary>
     /// The symbol a declaration introduces, as <c>symbolName</c> (fully qualified,
@@ -304,8 +325,10 @@ public sealed class GraphBuilder
     }
 
     /// <summary>
-    /// Records a call edge from the enclosing method to the resolved callee
-    /// symbol, when semantic information is available.
+    /// Records a call site from the enclosing method to the resolved callee
+    /// symbol, when semantic information is available. No edge is emitted
+    /// here: the registry resolves call sites to declaration nodes once every
+    /// file in the run has been built.
     /// </summary>
     private void AddCallEdge(SyntaxNode calleeSyntax)
     {
@@ -319,16 +342,7 @@ public sealed class GraphBuilder
         {
             return;
         }
-        if (!_symbolNodeIds.TryGetValue(symbol, out var callee))
-        {
-            callee = AddNode(new[] { "CSharpSymbol" }, new[]
-            {
-                KV("symbolKind", symbol.Kind.ToString()),
-                KV("symbolName", symbol.ToDisplayString(QualifiedFormat)),
-            });
-            _symbolNodeIds[symbol] = callee;
-        }
-        AddRel(_methodStack.Peek(), "CALLS", callee);
+        _registry.RecordCall(_methodStack.Peek(), symbol);
     }
 
     /// <summary>
@@ -1416,6 +1430,7 @@ public sealed class GraphBuilder
                     KV("isStatic", lf.Modifiers.Any(SyntaxKind.StaticKeyword)),
                     KV("isAsync", lf.Modifiers.Any(SyntaxKind.AsyncKeyword)),
                 }.Concat(DeclaredSymbolProps(lf)));
+                RegisterDeclaration(lf, id);
                 _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
                 BuildAttributeLists(lf.AttributeLists, id);
