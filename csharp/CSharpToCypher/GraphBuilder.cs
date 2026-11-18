@@ -2,6 +2,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.FlowAnalysis;
+using Microsoft.CodeAnalysis.Operations;
 
 namespace CSharpToCypher;
 
@@ -34,10 +35,11 @@ public sealed class GraphBuilder
         miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes | SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers);
 
     /// <param name="registry">
-    /// The run-wide registry that collects declarations and call sites so
-    /// <c>CALLS</c> edges can be resolved across files once every file is built
-    /// (see <see cref="SymbolRegistry.BuildCallDocument"/>). Without one, the
-    /// builder uses a private registry and its call sites are never emitted.
+    /// The run-wide registry that collects declarations, call sites and member
+    /// accesses so <c>CALLS</c>, <c>READS</c> and <c>WRITES</c> edges can be
+    /// resolved across files once every file is built (see
+    /// <see cref="SymbolRegistry.BuildDeferredDocument"/>). Without one, the
+    /// builder uses a private registry and those edges are never emitted.
     /// </param>
     public GraphBuilder(string file, SemanticModel? model = null, int startId = 0, SymbolRegistry? registry = null)
     {
@@ -344,6 +346,144 @@ public sealed class GraphBuilder
         }
         _registry.RecordCall(_methodStack.Peek(), symbol);
     }
+
+    /// <summary>
+    /// Records a read and/or write of a field or auto-property by the enclosing
+    /// function, for a simple name that is a standalone identifier (including
+    /// the <c>F</c> of <c>x?.F</c>) or the <c>Name</c> of a member access.
+    /// Nothing is recorded outside a
+    /// function, inside a property initializer, inside <c>nameof</c>, or for a
+    /// symbol <see cref="IsTrackedMember"/> rejects. The registry later drops
+    /// members that aren't declared in the input.
+    /// </summary>
+    private void RecordMemberAccess(SimpleNameSyntax name)
+    {
+        if (_model is null || _methodStack.Count == 0)
+        {
+            return;
+        }
+        var symbol = _model.GetSymbolInfo(name).Symbol;
+        if (symbol is null || !IsTrackedMember(symbol) || IsInPropertyInitializer(name) || IsInNameof(name))
+        {
+            return;
+        }
+        _registry.RecordAccess(_methodStack.Peek(), symbol, Classify(AccessTarget(name)));
+    }
+
+    /// <summary>
+    /// Whether accesses to <paramref name="symbol"/> become <c>READS</c>/<c>WRITES</c>:
+    /// a non-constant field that isn't an enum member, or an auto-property.
+    /// </summary>
+    private static bool IsTrackedMember(ISymbol symbol) => symbol switch
+    {
+        IFieldSymbol field => !field.IsConst && field.ContainingType.TypeKind != TypeKind.Enum,
+        IPropertySymbol property => IsAutoProperty(property),
+        _ => false,
+    };
+
+    /// <summary>
+    /// A property declared in source whose accessors all lack a body and an
+    /// expression body (<c>int P { get; set; }</c>), so it is plain storage.
+    /// Abstract and interface properties look the same but store nothing.
+    /// </summary>
+    private static bool IsAutoProperty(IPropertySymbol property)
+    {
+        if (property.IsAbstract || property.IsExtern)
+        {
+            return false;
+        }
+        return property.OriginalDefinition.DeclaringSyntaxReferences
+            .Select(r => r.GetSyntax())
+            .OfType<PropertyDeclarationSyntax>()
+            .Any(d => d.ExpressionBody is null
+                && d.AccessorList is not null
+                && d.AccessorList.Accessors.All(a => a.Body is null && a.ExpressionBody is null));
+    }
+
+    /// <summary>
+    /// Whether <paramref name="node"/> is in a property's <c>= value</c>
+    /// initializer (and not inside a lambda or local function there). The
+    /// property is on the method stack while its initializer is walked, but an
+    /// initializer runs outside any function, so its accesses are skipped, the
+    /// same as a field initializer's.
+    /// </summary>
+    private static bool IsInPropertyInitializer(SyntaxNode node)
+    {
+        foreach (var ancestor in node.Ancestors())
+        {
+            switch (ancestor)
+            {
+                case AnonymousFunctionExpressionSyntax or LocalFunctionStatementSyntax:
+                    return false;
+                case EqualsValueClauseSyntax { Parent: PropertyDeclarationSyntax }:
+                    return true;
+                case MemberDeclarationSyntax:
+                    return false;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Whether <paramref name="node"/> is an argument of <c>nameof(...)</c>, which names a member without accessing it.</summary>
+    private bool IsInNameof(SyntaxNode node) =>
+        node.Ancestors().OfType<InvocationExpressionSyntax>().Any(inv => _model!.GetOperation(inv) is INameOfOperation);
+
+    /// <summary>The expression whose context decides the access kind: for <c>x.F</c> it is the member access, not the bare name.</summary>
+    private static ExpressionSyntax AccessTarget(SimpleNameSyntax name) =>
+        name.Parent is MemberAccessExpressionSyntax access && access.Name == name ? access : name;
+
+    /// <summary>
+    /// Classifies a field/property access by its syntactic context:
+    /// <list type="bullet">
+    /// <item>left of a simple <c>=</c> (including an object-initializer member, <c>new T { F = 1 }</c>): write;</item>
+    /// <item>left of a compound assignment (<c>+=</c>, <c>??=</c>, …), or the operand of <c>++</c>/<c>--</c>: read and write;</item>
+    /// <item>an <c>out</c> argument: write; a <c>ref</c> argument: read and write;</item>
+    /// <item>an element of a deconstruction target (<c>(F, G) = t</c>): write;</item>
+    /// <item>anything else, including an <c>in</c> argument: read.</item>
+    /// </list>
+    /// A nested initializer (<c>new T { F = { 1, 2 } }</c>) reads <c>F</c> and
+    /// adds to it rather than replacing it, so it counts as a read.
+    /// </summary>
+    private static AccessKind Classify(ExpressionSyntax target)
+    {
+        SyntaxNode node = target;
+        while (node.Parent is ParenthesizedExpressionSyntax parenthesized)
+        {
+            node = parenthesized;
+        }
+        switch (node.Parent)
+        {
+            case AssignmentExpressionSyntax assignment when assignment.Left == node:
+                if (!assignment.IsKind(SyntaxKind.SimpleAssignmentExpression))
+                {
+                    return AccessKind.ReadWrite;
+                }
+                return assignment.Right is InitializerExpressionSyntax ? AccessKind.Read : AccessKind.Write;
+            case PrefixUnaryExpressionSyntax prefix
+                when prefix.IsKind(SyntaxKind.PreIncrementExpression) || prefix.IsKind(SyntaxKind.PreDecrementExpression):
+                return AccessKind.ReadWrite;
+            case PostfixUnaryExpressionSyntax postfix
+                when postfix.IsKind(SyntaxKind.PostIncrementExpression) || postfix.IsKind(SyntaxKind.PostDecrementExpression):
+                return AccessKind.ReadWrite;
+            case ArgumentSyntax { Parent: TupleExpressionSyntax tuple }:
+                return IsDeconstructionTarget(tuple) ? AccessKind.Write : AccessKind.Read;
+            case ArgumentSyntax argument when argument.RefKindKeyword.IsKind(SyntaxKind.OutKeyword):
+                return AccessKind.Write;
+            case ArgumentSyntax argument when argument.RefKindKeyword.IsKind(SyntaxKind.RefKeyword):
+                return AccessKind.ReadWrite;
+            default:
+                return AccessKind.Read;
+        }
+    }
+
+    /// <summary>Whether a tuple is (part of) what a deconstruction assigns to: <c>(F, G) = t</c>, <c>((F, G), H) = t</c> or <c>foreach ((F, G) in pairs)</c>.</summary>
+    private static bool IsDeconstructionTarget(TupleExpressionSyntax tuple) => tuple.Parent switch
+    {
+        AssignmentExpressionSyntax assignment => assignment.Left == tuple && assignment.IsKind(SyntaxKind.SimpleAssignmentExpression),
+        ForEachVariableStatementSyntax forEach => forEach.Variable == tuple,
+        ArgumentSyntax { Parent: TupleExpressionSyntax outer } => IsDeconstructionTarget(outer),
+        _ => false,
+    };
 
     /// <summary>
     /// Attaches every meaningful trivia (comments, preprocessor directives) to the
@@ -1480,6 +1620,7 @@ public sealed class GraphBuilder
                 props.AddRange(SymbolProps(idn));
                 var id = CreateExpressionNode(idn, "CSharpIdentifierName", props);
                 AddRel(parentId, parentEdge, id);
+                RecordMemberAccess(idn);
                 break;
             }
             case GenericNameSyntax gn:
@@ -1526,6 +1667,8 @@ public sealed class GraphBuilder
                 props.AddRange(SymbolProps(ma));
                 var id = CreateExpressionNode(ma, "CSharpMemberAccessExpression", props);
                 AddRel(parentId, parentEdge, id);
+                // ma.Name gets no node of its own, so record its access here.
+                RecordMemberAccess(ma.Name);
                 BuildNode(ma.Expression, "HAS_EXPRESSION", id);
                 break;
             }

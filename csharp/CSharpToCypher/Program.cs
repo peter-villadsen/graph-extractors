@@ -173,14 +173,15 @@ internal static class Program
         }
         else
         {
-            // Every declaration in the run is known now, so call sites can be
-            // resolved to declaration nodes, including ones in other files.
-            var calls = registry.BuildCallDocument(nextId, out nextId);
+            // Every declaration in the run is known now, so call sites and
+            // field/property accesses can be resolved to declaration nodes,
+            // including ones in other files.
+            var deferred = registry.BuildDeferredDocument(nextId, out nextId);
             if (verbose)
             {
-                Console.Error.WriteLine($"[verbose] calls: {calls.Nodes.Count} external symbols, {calls.Relationships.Count} CALLS edges");
+                Console.Error.WriteLine($"[verbose] deferred: {deferred.Nodes.Count} external symbols, {deferred.Relationships.Count} CALLS/READS/WRITES edges");
             }
-            writer.Write(calls);
+            writer.Write(deferred);
             writer.Finish();
         }
 

@@ -61,7 +61,7 @@ public class GraphBuilderTests
             merged.Nodes.AddRange(document.Nodes);
             merged.Relationships.AddRange(document.Relationships);
         }
-        var calls = registry.BuildCallDocument(nextId, out _);
+        var calls = registry.BuildDeferredDocument(nextId, out _);
         merged.Nodes.AddRange(calls.Nodes);
         merged.Relationships.AddRange(calls.Relationships);
         return merged;
@@ -740,6 +740,182 @@ public class GraphBuilderTests
     {
         var doc = Build(AllDeclarationsSource);
         Assert.DoesNotContain(doc.Nodes, n => n.Properties.ContainsKey("symbolName") || n.Properties.ContainsKey("symbolKind"));
+    }
+
+    // -- READS / WRITES -----------------------------------------------------
+
+    private static readonly string[] Reads = { "READS" };
+    private static readonly string[] Writes = { "WRITES" };
+    private static readonly string[] ReadsAndWrites = { "READS", "WRITES" };
+
+    private static bool IsAccessEdge(CypherRelationship r) => r.Type is "READS" or "WRITES";
+
+    /// <summary>The sorted READS/WRITES edge types from method <paramref name="caller"/> to the declaration whose symbolName is <paramref name="member"/>.</summary>
+    private static string[] Access(CypherDocument doc, string caller, string member)
+    {
+        var callerId = Method(doc, caller).Id;
+        var memberId = doc.Nodes.Single(n =>
+            n.Labels.Contains("CSharpDeclaration") && n.Properties.TryGetValue("symbolName", out var s) && s as string == member).Id;
+        return doc.Relationships
+            .Where(r => r.Source == callerId && r.Target == memberId && IsAccessEdge(r))
+            .Select(r => r.Type)
+            .OrderBy(t => t, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    [Fact]
+    public void Simple_assignment_writes()
+    {
+        var doc = BuildWithModel("class C { int F; void M() { F = 1; } }");
+        Assert.Equal(Writes, Access(doc, "M", "C.F"));
+    }
+
+    [Theory]
+    [InlineData("F += 1;")]
+    [InlineData("F -= 1;")]
+    [InlineData("S ??= \"x\";")]
+    public void Compound_assignment_reads_and_writes(string statement)
+    {
+        var doc = BuildWithModel("class C { int F; string? S; void M() { " + statement + " } }");
+        var member = statement.StartsWith("S") ? "C.S" : "C.F";
+        Assert.Equal(ReadsAndWrites, Access(doc, "M", member));
+    }
+
+    [Theory]
+    [InlineData("F++;")]
+    [InlineData("F--;")]
+    [InlineData("++F;")]
+    [InlineData("--F;")]
+    public void Increment_and_decrement_read_and_write(string statement)
+    {
+        var doc = BuildWithModel("class C { int F; void M() { " + statement + " } }");
+        Assert.Equal(ReadsAndWrites, Access(doc, "M", "C.F"));
+    }
+
+    [Fact]
+    public void Out_argument_writes()
+    {
+        var doc = BuildWithModel("class C { int F; void M() { Set(out F); } static void Set(out int x) { x = 1; } }");
+        Assert.Equal(Writes, Access(doc, "M", "C.F"));
+    }
+
+    [Fact]
+    public void Ref_argument_reads_and_writes()
+    {
+        var doc = BuildWithModel("class C { int F; void M() { Bump(ref F); } static void Bump(ref int x) { x++; } }");
+        Assert.Equal(ReadsAndWrites, Access(doc, "M", "C.F"));
+    }
+
+    [Fact]
+    public void In_argument_reads()
+    {
+        var doc = BuildWithModel("class C { int F; void M() { Look(in F); } static void Look(in int x) { } }");
+        Assert.Equal(Reads, Access(doc, "M", "C.F"));
+    }
+
+    [Fact]
+    public void Any_other_use_reads()
+    {
+        var doc = BuildWithModel("class C { int F; int M() { int y = F; return y; } }");
+        Assert.Equal(Reads, Access(doc, "M", "C.F"));
+    }
+
+    [Fact]
+    public void Object_initializer_member_assignment_writes()
+    {
+        var doc = BuildWithModel("class T { public int F; } class C { void M() { var t = new T { F = 1 }; } }");
+        Assert.Equal(Writes, Access(doc, "M", "T.F"));
+    }
+
+    [Fact]
+    public void Deconstruction_assignment_writes_each_target()
+    {
+        var doc = BuildWithModel("class C { int F; int G; void M((int, int) t) { (F, G) = t; } }");
+        Assert.Equal(Writes, Access(doc, "M", "C.F"));
+        Assert.Equal(Writes, Access(doc, "M", "C.G"));
+    }
+
+    [Fact]
+    public void Member_access_on_this_or_other_instance_writes()
+    {
+        var doc = BuildWithModel("class C { int F; void M(C other) { this.F = 1; other.F = 2; } }");
+        Assert.Equal(Writes, Access(doc, "M", "C.F"));
+        var edge = Assert.Single(doc.Relationships, r => r.Type == "WRITES");
+        Assert.Equal(2, edge.Properties!["count"]);
+    }
+
+    [Fact]
+    public void Static_field_written_in_one_method_and_read_in_another()
+    {
+        var doc = BuildWithModel("class C { static int S; void W() { S = 1; } int R() { return S; } }");
+        Assert.Equal(Writes, Access(doc, "W", "C.S"));
+        Assert.Equal(Reads, Access(doc, "R", "C.S"));
+    }
+
+    [Fact]
+    public void Field_declared_in_one_file_and_written_in_another()
+    {
+        var doc = BuildRun(
+            ("a.cs", "class A { public int F; }"),
+            ("b.cs", "class B { void M(A a) { a.F = 1; } }"));
+        Assert.Equal(Writes, Access(doc, "M", "A.F"));
+        var target = doc.Nodes.Single(n => n.Id == Assert.Single(doc.Relationships, r => r.Type == "WRITES").Target);
+        Assert.Contains("CSharpVariableDeclarator", target.Labels);
+    }
+
+    [Fact]
+    public void Auto_property_access_targets_the_property_declaration()
+    {
+        var doc = BuildWithModel("class C { int P { get; set; } void M() { P = P + 1; } }");
+        Assert.Equal(ReadsAndWrites, Access(doc, "M", "C.P"));
+        Assert.All(doc.Relationships.Where(IsAccessEdge), r =>
+            Assert.Contains("CSharpPropertyDeclaration", doc.Nodes.Single(n => n.Id == r.Target).Labels));
+    }
+
+    [Fact]
+    public void Non_auto_property_local_parameter_const_and_enum_member_produce_no_edges()
+    {
+        var doc = BuildWithModel("""
+            enum E { X }
+            class C
+            {
+                const int K = 1;
+                int _b;
+                int B { get { return _b; } set { _b = value; } }
+                void M(int p)
+                {
+                    int l = 0;
+                    l = p;
+                    B = K;
+                    var e = E.X;
+                }
+            }
+            """);
+        var m = Method(doc, "M");
+        Assert.DoesNotContain(doc.Relationships, r => r.Source == m.Id && IsAccessEdge(r));
+    }
+
+    [Fact]
+    public void Repeated_reads_share_one_edge_with_count()
+    {
+        var doc = BuildWithModel("class C { int F; int M() { return F + F + F; } }");
+        var edge = Assert.Single(doc.Relationships, IsAccessEdge);
+        Assert.Equal("READS", edge.Type);
+        Assert.Equal(3, edge.Properties!["count"]);
+    }
+
+    [Fact]
+    public void Field_and_property_initializers_are_skipped()
+    {
+        var doc = BuildWithModel("class C { static int F; int P { get; } = F; int G = F; }");
+        Assert.DoesNotContain(doc.Relationships, IsAccessEdge);
+    }
+
+    [Fact]
+    public void Nameof_is_not_an_access()
+    {
+        var doc = BuildWithModel("class C { int F; string M() => nameof(F); }");
+        Assert.DoesNotContain(doc.Relationships, IsAccessEdge);
     }
 }
 

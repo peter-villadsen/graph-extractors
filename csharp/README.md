@@ -166,6 +166,8 @@ declarators, so `int a, b;` gives two declarators named `…a` and `…b`.
 (:CSharpTryStatement)-[:HAS_CATCH]->(:CSharpCatchClause)
 (:CSharpNode)-[:HAS_TRIVIA]->(:CSharpTrivia)
 (:CSharpDeclaration)-[:CALLS {count}]->(:CSharpDeclaration|:CSharpSymbol) -- resolved callee, see below
+(:CSharpDeclaration)-[:READS {count}]->(:CSharpDeclaration)     -- field / auto-property, see below
+(:CSharpDeclaration)-[:WRITES {count}]->(:CSharpDeclaration)
 ```
 
 ### `CALLS`
@@ -198,6 +200,55 @@ implicit default constructor, a record's primary constructor — gets a
 > `(:CSharpDeclaration)-[:CALLS]->(:CSharpSymbol)` for in-source callees should
 > match the declaration instead, e.g.
 > `MATCH (caller)-[c:CALLS]->(m:CSharpMethodDeclaration {name: 'Fly'}) RETURN caller, c.count`.
+
+### `READS` / `WRITES`
+
+```cypher
+(function)-[:READS {count}]->(:CSharpVariableDeclarator|:CSharpPropertyDeclaration)
+(function)-[:WRITES {count}]->(:CSharpVariableDeclarator|:CSharpPropertyDeclaration)
+```
+
+Field-level data flow: which functions read or write which state. The
+function is the same innermost method-like node that `CALLS` uses. The
+target is a **field** (its `CSharpVariableDeclarator`, one per variable in
+`int a, b;`) or an **auto-property** (`int P { get; set; }`, its
+`CSharpPropertyDeclaration`), declared anywhere in the input, including
+another file. Like `CALLS`, these edges are resolved after every file is
+built, matched by symbol identity (generic members map to their definition),
+and there is one edge per (function, member, type) with `count` = the number
+of accesses.
+
+Each access is classified by its syntactic context. For `this.F` and `obj.F`,
+the context is that of the whole member access:
+
+| Context | Edge |
+| --- | --- |
+| left side of a simple `=` assignment | `WRITES` |
+| left side of a compound assignment (`+=`, `-=`, `??=`, …) | `READS` + `WRITES` |
+| operand of prefix/postfix `++` / `--` | `READS` + `WRITES` |
+| argument with `out` | `WRITES` |
+| argument with `ref` | `READS` + `WRITES` |
+| argument with `in`, or any other use | `READS` |
+| member assignment in an object initializer (`new T { F = 1 }`) | `WRITES` |
+| target of a deconstruction assignment (`(F, G) = t`, also `foreach ((F, G) in pairs)`) | `WRITES` |
+
+A nested initializer (`new T { F = { 1, 2 } }`) adds to `F` rather than
+replacing it, so it counts as `READS`.
+
+No edges are produced for locals, parameters, constants, enum members,
+properties with accessor bodies (their accessors' own field accesses are
+recorded instead), abstract/interface properties, indexers, members declared
+outside the input, or `nameof(F)`. **Field and property initializers**
+(`int G = F;`, `int P { get; } = F;`) run outside any function and are
+skipped, except for code inside a lambda in the initializer, which is
+attributed to that lambda.
+
+Who writes the state that someone else reads:
+
+```cypher
+MATCH (w)-[:WRITES]->(f)<-[:READS]-(r) WHERE w <> r
+RETURN w.symbolName AS writer, f.symbolName AS state, r.symbolName AS reader
+```
 
 ---
 
