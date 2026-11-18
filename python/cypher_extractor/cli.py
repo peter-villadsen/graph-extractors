@@ -7,7 +7,7 @@ import ast
 import os
 import sys
 
-from .ast_graph import GraphBuilder
+from .ast_graph import GraphBuilder, default_module_name
 from .souffle import SouffleProgram
 from .writers import CypherStreamWriter, Neo4jAdminImportWriter
 
@@ -15,18 +15,41 @@ EXTENSIONS = (".py",)
 
 
 def collect_files(paths, extensions):
-    files = []
+    """Expand the PATH arguments into sorted ``(file, root)`` pairs.
+
+    ``root`` is the directory argument the file was found under, or ``None``
+    for a file passed directly; ``module_name_for`` needs it to derive the
+    package-qualified module name. A file reachable from several arguments
+    keeps the first one."""
+    roots = {}
     for path in paths:
         if os.path.isdir(path):
-            for root, _dirs, names in os.walk(path):
+            for directory, _dirs, names in os.walk(path):
                 for name in sorted(names):
                     if name.lower().endswith(extensions):
-                        files.append(os.path.join(root, name))
+                        roots.setdefault(os.path.join(directory, name), path)
         elif os.path.isfile(path):
-            files.append(path)
+            roots.setdefault(path, None)
         else:
             print(f"warning: no such file or directory: {path}", file=sys.stderr)
-    return sorted(set(files))
+    return sorted(roots.items())
+
+
+def module_name_for(path, root):
+    """The dotted module name of ``path``.
+
+    Under a directory argument ``root`` it is the path relative to the root,
+    without the extension and with separators turned into dots
+    (``pkg/sub/mod.py`` -> ``pkg.sub.mod``); a package's ``__init__.py`` is
+    named after the package (``pkg/__init__.py`` -> ``pkg``). A file passed
+    directly (``root`` is ``None``) is named by its stem."""
+    if root is None:
+        return default_module_name(path)
+    relative = os.path.splitext(os.path.relpath(path, root))[0]
+    parts = os.path.normpath(relative).split(os.sep)
+    if len(parts) > 1 and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
 
 
 def main(argv=None) -> int:
@@ -107,7 +130,7 @@ def main(argv=None) -> int:
     else:
         writer = CypherStreamWriter(sys.stdout)
     next_id = 0
-    for path in files:
+    for path, root in files:
         if args.verbose:
             print(f"[verbose] reading {path}", file=sys.stderr)
         try:
@@ -127,7 +150,7 @@ def main(argv=None) -> int:
             print(f"[ast] {path}", file=sys.stderr)
             print(ast.dump(tree, indent=2, include_attributes=False), file=sys.stderr)
 
-        builder = GraphBuilder(source, path, next_id)
+        builder = GraphBuilder(source, path, next_id, module_name=module_name_for(path, root))
         builder.build(tree)
         next_id = builder._counter
 

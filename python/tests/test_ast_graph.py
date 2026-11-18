@@ -1,16 +1,20 @@
 """Tests for the Python -> Cypher extractor (stdlib unittest)."""
 
 import ast
+import contextlib
 import csv
 import io
 import os
+import re
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cypher_extractor import cli
 from cypher_extractor.ast_graph import GraphBuilder
+from cypher_extractor.cli import module_name_for
 from cypher_extractor.cypher import Node, Relationship, escape_string, format_value
 from cypher_extractor.souffle import SouffleProgram
 from cypher_extractor.writers import CypherStreamWriter, Neo4jAdminImportWriter
@@ -677,6 +681,103 @@ class Neo4jAdminImportWriterTests(unittest.TestCase):
         self.assertEqual(rows[1], ["p1", "PythonConstant", "1"])
         self.assertEqual(rows[2], ["p2", "PythonConstant", "is"])
         self.assertEqual(rows[3], ["p3", "PythonConstant", "true"])
+
+
+def qualnames(nodes, label):
+    """Return the ``qualname`` of every node carrying ``label``, in node order."""
+    return [n.properties.get("qualname") for n in nodes if label in n.labels]
+
+
+def cli_module_qualnames(*paths):
+    """Run the CLI (Cypher mode) on ``paths`` and return the sorted
+    ``qualname`` values of the emitted ``PythonModule`` nodes."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        status = cli.main(list(paths))
+    if status != 0:
+        raise AssertionError(f"cli exited with {status}")
+    found = re.findall(r"CREATE \(\w+:PythonModule \{[^\n]*?qualname: '([^']*)'", out.getvalue())
+    return sorted(found)
+
+
+class QualnameTests(unittest.TestCase):
+    NESTED = (
+        "class C:\n"
+        "    def m(self):\n"
+        "        def inner():\n"
+        "            pass\n"
+        "        return inner\n"
+    )
+
+    def test_module_class_method_and_nested_function_qualnames(self):
+        tree = ast.parse(self.NESTED)
+        nodes, _ = GraphBuilder(self.NESTED, "a/b/mod.py", module_name="a.b.mod").build(tree)
+        self.assertEqual(qualnames(nodes, "PythonModule"), ["a.b.mod"])
+        self.assertEqual(qualnames(nodes, "PythonClassDefinition"), ["a.b.mod.C"])
+        self.assertEqual(
+            qualnames(nodes, "PythonFunctionDefinition"),
+            ["a.b.mod.C.m", "a.b.mod.C.m.inner"],
+        )
+
+    def test_async_function_gets_a_qualname(self):
+        source = "async def go():\n    pass\n"
+        nodes, _ = GraphBuilder(source, "m.py", module_name="pkg.m").build(ast.parse(source))
+        self.assertEqual(qualnames(nodes, "PythonAsyncFunctionDefinition"), ["pkg.m.go"])
+
+    def test_name_properties_are_unchanged(self):
+        nodes, _ = GraphBuilder(self.NESTED, "a/b/mod.py", module_name="a.b.mod").build(ast.parse(self.NESTED))
+        self.assertEqual(nodes[0].properties["name"], "mod.py")
+        self.assertEqual(
+            [n.properties["name"] for n in nodes if "PythonFunctionDefinition" in n.labels],
+            ["m", "inner"],
+        )
+
+    def test_without_module_name_falls_back_to_file_stem(self):
+        nodes, _ = build("def f():\n    pass\n", "dir/tool.py")
+        self.assertEqual(qualnames(nodes, "PythonModule"), ["tool"])
+        self.assertEqual(qualnames(nodes, "PythonFunctionDefinition"), ["tool.f"])
+
+    def test_cfg_scope_of_a_method_equals_its_qualname(self):
+        tree = ast.parse(self.NESTED)
+        builder = GraphBuilder(self.NESTED, "a/b/mod.py", module_name="a.b.mod")
+        builder.build(tree)
+        builder.build_cfg(tree)
+        method = next(n for n in builder._nodes if n.properties.get("name") == "m")
+        scopes = {n.properties["scope"] for n in builder._nodes if "PythonBasicBlock" in n.labels}
+        self.assertIn(method.properties["qualname"], scopes)
+        self.assertEqual(scopes, {"a.b.mod", "a.b.mod.C", "a.b.mod.C.m", "a.b.mod.C.m.inner"})
+
+    def test_module_name_for_paths_under_a_root(self):
+        root = os.path.join("src")
+        self.assertEqual(module_name_for(os.path.join(root, "pkg", "sub", "mod.py"), root), "pkg.sub.mod")
+        self.assertEqual(module_name_for(os.path.join(root, "pkg", "__init__.py"), root), "pkg")
+        self.assertEqual(module_name_for(os.path.join(root, "top.py"), root), "top")
+
+    def test_module_name_for_a_file_passed_directly_is_its_stem(self):
+        self.assertEqual(module_name_for(os.path.join("some", "dir", "tool.py"), None), "tool")
+
+    def test_cli_same_file_name_in_two_packages_gets_distinct_qualnames(self):
+        with tempfile.TemporaryDirectory() as root:
+            for package in ("x", "y"):
+                os.makedirs(os.path.join(root, package))
+                with open(os.path.join(root, package, "utils.py"), "w", encoding="utf-8") as handle:
+                    handle.write("def helper():\n    pass\n")
+            self.assertEqual(cli_module_qualnames(root), ["x.utils", "y.utils"])
+
+    def test_cli_package_init_is_named_after_the_package(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "pkg"))
+            with open(os.path.join(root, "pkg", "__init__.py"), "w", encoding="utf-8") as handle:
+                handle.write("VALUE = 1\n")
+            self.assertEqual(cli_module_qualnames(root), ["pkg"])
+
+    def test_cli_file_passed_directly_is_named_by_its_stem(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "deep", "er"))
+            path = os.path.join(root, "deep", "er", "tool.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("pass\n")
+            self.assertEqual(cli_module_qualnames(path), ["tool"])
 
 
 if __name__ == "__main__":

@@ -503,6 +503,26 @@ class _CfgScopeBuilder:
         return None
 
 
+# Definitions that open a naming scope: their qualname extends the enclosing one.
+_SCOPE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def default_module_name(filename):
+    """The module name used when none is given: the file's stem
+    (``dir/tool.py`` -> ``tool``), or ``module`` if that is empty."""
+    return os.path.splitext(os.path.basename(filename))[0] or "module"
+
+
+def scope_qualname(parent_qualname, node):
+    """The qualname of the class/function definition ``node`` inside the
+    scope named ``parent_qualname`` (``pkg.mod`` + ``C`` -> ``pkg.mod.C``).
+
+    The single source of truth for naming: both the AST walk's ``qualname``
+    properties and the CFG ``scope`` names (``_iter_scopes``) use it, so they
+    can't drift apart."""
+    return f"{parent_qualname}.{node.name}"
+
+
 def _iter_scopes(node, qualname):
     """Yield ``(qualname, body)`` for ``node``'s own body (if it has one) and
     recurse into every nested function/class definition's body, building
@@ -512,16 +532,23 @@ def _iter_scopes(node, qualname):
         return
     yield qualname, body
     for stmt in body:
-        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            yield from _iter_scopes(stmt, f"{qualname}.{stmt.name}")
+        if isinstance(stmt, _SCOPE_TYPES):
+            yield from _iter_scopes(stmt, scope_qualname(qualname, stmt))
 
 
 class GraphBuilder:
     """Builds nodes/relationships for one parsed module."""
 
-    def __init__(self, source: str, filename: str, start_id: int = 0):
+    def __init__(self, source: str, filename: str, start_id: int = 0, module_name=None):
+        """``module_name`` is the dotted, package-qualified name of the module
+        (``pkg.sub.mod``), the root of every ``qualname`` and CFG ``scope``.
+        When omitted it falls back to the file's stem."""
         self._source = source
         self._filename = filename
+        self._module_name = module_name or default_module_name(filename)
+        # qualnames of the module/class/function definitions enclosing the
+        # node being visited, innermost last.
+        self._qualname_stack = []
         self._nodes = []
         self._relationships = []
         self._counter = start_id
@@ -555,10 +582,9 @@ class GraphBuilder:
         dependency, unlike the CFG pass this extractor used to hand off to
         the (unmaintained, `match`-statement-unaware) `py2cfg` package.
         """
-        module_name = os.path.splitext(os.path.basename(self._filename))[0] or "module"
         self._cfg_blocks = []
         self._cfg_edges = []
-        for qualname, body in _iter_scopes(tree, module_name):
+        for qualname, body in _iter_scopes(tree, self._module_name):
             self._emit_cfg_scope(qualname, body)
 
     def _emit_cfg_scope(self, qualname, body):
@@ -756,13 +782,32 @@ class GraphBuilder:
 
         labels = self._labels_for(class_name, node)
         props = self._props_for(class_name, node)
+        qualname = self._qualname_for(node)
+        if qualname is not None:
+            props["qualname"] = qualname
         props.update(_location_props(node))
         is_stmt = isinstance(node, ast.stmt)
         node_id = self._add_node(labels, props, lineno, record=is_stmt)
         self._node_ids[id(node)] = node_id
         self._rel(parent_id, edge, node_id)
-        self._visit_children(node, node_id)
+        if qualname is None:
+            self._visit_children(node, node_id)
+        else:
+            self._qualname_stack.append(qualname)
+            self._visit_children(node, node_id)
+            self._qualname_stack.pop()
         return node_id
+
+    def _qualname_for(self, node):
+        """The ``qualname`` of a module, class or function definition node
+        (``None`` for anything else): the module name for the module, else
+        the enclosing definition's qualname extended by ``scope_qualname``."""
+        if isinstance(node, ast.Module):
+            return self._module_name
+        if isinstance(node, _SCOPE_TYPES):
+            parent = self._qualname_stack[-1] if self._qualname_stack else self._module_name
+            return scope_qualname(parent, node)
+        return None
 
     def _visit_children(self, node, node_id):
         if self._visit_special(node, node_id):

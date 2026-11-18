@@ -55,8 +55,8 @@ Every construct becomes a node with coordinates, every containment a
 relationship (trimmed here for brevity):
 
 ```cypher
-CREATE (p1:PythonModule {file: 'greet.py', name: 'greet.py', id: 'p1'});
-CREATE (p2:PythonFunctionDefinition:PythonStatement {name: 'greet', isAsync: false, startLine: 1, startColumn: 0, endLine: 4, endColumn: 26, id: 'p2'});
+CREATE (p1:PythonModule {file: 'greet.py', name: 'greet.py', qualname: 'greet', id: 'p1'});
+CREATE (p2:PythonFunctionDefinition:PythonStatement {name: 'greet', isAsync: false, qualname: 'greet.greet', startLine: 1, startColumn: 0, endLine: 4, endColumn: 26, id: 'p2'});
 CREATE (p6:PythonIfStatement:PythonStatement {startLine: 2, startColumn: 4, endLine: 3, endColumn: 23, id: 'p6'});
 CREATE (p9:PythonReturnStatement:PythonStatement {startLine: 3, startColumn: 8, endLine: 3, endColumn: 23, id: 'p9'});
 MATCH (a {id: 'p2'}), (b {id: 'p6'}) CREATE (a)-[:CONTAINS]->(b);
@@ -167,6 +167,33 @@ preceding statement as trivia.
 Node ids are `p1`, `p2`, … Every statement carries `PythonStatement` and every
 expression carries `PythonExpression` as an extra label for querying.
 
+**Qualified names**: `PythonModule`, `PythonClassDefinition` and
+`PythonFunctionDefinition` (including async) nodes carry a package-qualified
+`qualname`, unique across the run, next to their plain `name`:
+
+| Node | `qualname` |
+| ---- | ---------- |
+| module | the dotted module name, e.g. `pkg.sub.mod` |
+| class / function | the enclosing definition's `qualname` + `.` + its name, e.g. `pkg.sub.mod.Class.method`, `pkg.sub.mod.Class.method.inner` |
+
+Nesting goes through classes and functions only (no `<locals>`): a `def`
+inside an `if` or `for` is named after the nearest enclosing definition.
+
+The module name comes from the `PATH` argument the file was found under:
+
+* under a directory argument, it is the path relative to that directory,
+  without `.py` and with separators turned into dots, so running on `src`
+  names `src/pkg/sub/mod.py` `pkg.sub.mod`, and two `utils.py` files in
+  `src/x` and `src/y` become `x.utils` and `y.utils`;
+* a package's `__init__.py` is named after the package (`src/pkg/__init__.py`
+  → `pkg`);
+* a file passed directly is named by its stem (`python -m cypher_extractor
+  src/pkg/tool.py` → `tool`), so pass the source root as the argument to get
+  package-qualified names.
+
+CFG `scope`s (below) use exactly the same names, so a function's blocks are
+`MATCH (f:PythonFunctionDefinition), (b:PythonBasicBlock) WHERE b.scope = f.qualname`.
+
 **Order**: statements in a body are chained with `FOLLOWS` in source order.
 Wherever else order is semantically meaningful — binary/comparison operand
 order, call/decorator arguments, parameter lists (in calling-convention
@@ -233,7 +260,8 @@ further blocks created only at actual branch points: `if`/`elif`/`else`,
 `while`/`for` (+ `else`, `break`, `continue`), `match`/`case` (**one block per
 case**, unlike the old dependency), and `try`/`except`/`else`/`finally`.
 Nested `def`/`class` bodies get their own independent CFG, scoped by dotted
-qualname (`module.Class.method`).
+qualname (`module.Class.method`), the same `qualname` the definition node
+carries.
 
 Each basic block becomes a `PythonBasicBlock` node with `ordinal` (position
 within its scope), `isEntry`/`isFinal`/`isReachable`, `scope`, `kind` (the
@@ -321,7 +349,8 @@ reachable(Target, Function) :- reachable(Source, Function),
                                control_flow_edge(Source, Target, Function, _).
 ```
 
-Python scopes use `module.function` / `module.Class.method`.
+Python scopes use the definitions' `qualname`: `module.function` /
+`module.Class.method`.
 
 ---
 
