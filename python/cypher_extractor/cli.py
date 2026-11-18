@@ -8,6 +8,7 @@ import os
 import sys
 
 from .ast_graph import GraphBuilder, default_module_name
+from .call_resolver import CallResolver
 from .souffle import SouffleProgram
 from .writers import CypherStreamWriter, Neo4jAdminImportWriter
 
@@ -129,6 +130,8 @@ def main(argv=None) -> int:
         writer = Neo4jAdminImportWriter(args.output_dir, args.database, sys.stdout)
     else:
         writer = CypherStreamWriter(sys.stdout)
+    # Shared by every file so CALLS edges resolve across the whole run.
+    resolver = CallResolver()
     next_id = 0
     for path, root in files:
         if args.verbose:
@@ -150,7 +153,8 @@ def main(argv=None) -> int:
             print(f"[ast] {path}", file=sys.stderr)
             print(ast.dump(tree, indent=2, include_attributes=False), file=sys.stderr)
 
-        builder = GraphBuilder(source, path, next_id, module_name=module_name_for(path, root))
+        module_name = module_name_for(path, root)
+        builder = GraphBuilder(source, path, next_id, module_name=module_name)
         builder.build(tree)
         next_id = builder._counter
 
@@ -173,11 +177,20 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
 
+        # Registered only for files whose nodes are written, so every CALLS
+        # edge ends at a node that exists.
+        is_package = os.path.basename(path) == "__init__.py"
+        resolver.add_module(module_name, is_package, tree, builder._node_ids)
         writer.write(builder._nodes, builder._relationships)
 
     if souffle is not None:
         print(souffle.render(), end="")
     else:
+        # Every module is known now, so calls can be resolved across files.
+        calls = resolver.relationships()
+        if args.verbose:
+            print(f"[verbose] {len(calls)} CALLS edges", file=sys.stderr)
+        writer.write([], calls)
         writer.finish()
 
     return 0

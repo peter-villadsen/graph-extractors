@@ -237,6 +237,78 @@ than one AST field, e.g. `BinOp`'s separate `left`/`right` fields (both
 (:PythonForStatement)-[:HAS_ITERABLE]->(:PythonExpression)
 (:PythonTryStatement)-[:HAS_HANDLER]->(:PythonExceptHandler)
 (:PythonStatement)-[:HAS_TRIVIA]->(:PythonCommentTrivia)
+(caller)-[:CALLS {count}]->(:PythonFunctionDefinition)       -- best effort, see below
+```
+
+### `CALLS`
+
+**Never guess.** Python is dynamic, so a call is tied to a definition only
+when the code leaves no doubt. A missing edge is acceptable; a wrong edge is
+not. Everything not listed below gets no edge.
+
+The **caller** is the innermost enclosing function (`def` / `async def`).
+Top-level code has the `PythonModule` node as caller, and code in a class
+body outside any method has its `PythonClassDefinition`. Calls in a `def`'s
+decorators or default values run in the enclosing scope and are attributed
+to it. One `CALLS` edge is emitted per (caller, callee) pair, with `count` =
+the number of call sites. Calls are resolved after every file is built, so
+they connect across files.
+
+| Call form | Resolves to |
+| --- | --- |
+| `f()` where `f` is a `def` at module level in the same module, not shadowed in the calling function | that function |
+| `f()` where `f` is a nested `def` in the calling or an enclosing function | that nested function |
+| `self.m()` / `cls.m()` in a method of class `C` (through its first parameter), where `C`'s own body defines `m` | `C.m` |
+| `C.m()` where `C` is a class defined in the same module and its body defines `m` | `C.m` |
+| `C()` where `C` is a class in the same module whose body defines `__init__` | `C.__init__` |
+| `f()` after `from pkg.mod import f` (or `… import f as g` → `g()`), where `pkg.mod` is in the same run and defines `f` at module level | that function |
+| `mod.f()` after `import pkg.mod as mod`, or `pkg.mod.f()` after `import pkg.mod`, same conditions | that function |
+
+Relative imports (`from .mod import f`) resolve against the importing
+module's package (the module itself for an `__init__.py`). Module names are
+the `qualname`s described above, so pass the source root as `PATH` for
+imports between files to resolve. An imported class works like a local one
+(`C()`, `C.m()`).
+
+A name resolves only when its scope binds it **exactly once**, by a `def`,
+`class` or `import` placed directly in that scope's body, and only when the
+call comes after that binding in the same scope. Name lookup follows
+Python's rules: local, then enclosing functions (class bodies are only
+visible to their own code), then the module, honouring `global` and
+`nonlocal`.
+
+**Not resolved** (no edge), explicitly:
+
+* builtins (`print()`, `len()`, `getattr(...)`) and anything from a module
+  outside the run (the standard library, third-party packages);
+* calls on parameters or other unknown objects (`obj.m()`), and calls
+  through variables, containers or call results (`table['f']()`,
+  `make()()`);
+* inherited methods: `self.m()` where `m` is only defined on a base class;
+* names that are conditional (a `def` or `import` inside `if`/`try`/…),
+  redefined, rebound by assignment, a parameter, a loop target, or rebound
+  through `global`/`nonlocal` from another function;
+* decorated targets: functions, methods and classes with any decorator
+  other than the builtin `staticmethod` / `classmethod`, and classes with
+  keywords such as `metaclass=`;
+* star imports: a module with `from x import *` resolves no module-level
+  names;
+* a class that defines `__new__`, or a constructor call on a class without
+  its own `__init__`;
+* a method (including `__init__`) whose name is assigned as an attribute
+  anywhere in the run (`obj.m = ...`, `setattr(obj, 'm', ...)`), and every
+  method after a `setattr` with a computed name.
+
+Over-approximation only ever drops edges. For example, names bound inside a
+lambda or comprehension count as bindings of the enclosing function, and two
+files with the same module name make imports of that name unresolvable.
+Monkey-patching that is not a direct attribute assignment or `setattr`
+(through `__dict__`, say) is not detected.
+
+```cypher
+// who calls compute(), and how often
+MATCH (caller)-[c:CALLS]->(f:PythonFunctionDefinition {qualname: 'sample.compute'})
+RETURN caller.qualname, c.count
 ```
 
 ---

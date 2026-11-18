@@ -29,6 +29,9 @@ class Dog(Animal):
     def speak(self) -> str:
         return "Woof"
 
+    def greet(self) -> str:
+        return self.speak() + "!"
+
     def run(self, distance: float) -> float:
         if distance > 10:
             result = distance * 2
@@ -92,3 +95,8 @@ def use_match(value):
 
 def imports():
     print(m.sqrt(16))
+
+
+def main():
+    """Calls into definitions above, so CALLS edges resolve."""
+    return compute([1, 2, 3]), lambdas()
