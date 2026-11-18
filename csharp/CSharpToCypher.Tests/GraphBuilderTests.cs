@@ -558,6 +558,104 @@ public class GraphBuilderTests
             .ToList();
         Assert.Equal(new[] { 0, 1, 2 }, ordinals);
     }
+
+    // -- declared symbols -------------------------------------------------
+
+    private const string AllDeclarationsSource = """
+        namespace N
+        {
+            public delegate void D(int x);
+            public enum E { A, B }
+            public interface I { void Run(); }
+            public struct S { }
+            public record R(int X);
+            public record struct RS(int Y);
+            public class C
+            {
+                private int a;
+                public event System.EventHandler? Ev1;
+                public event System.EventHandler Ev2 { add { } remove { } }
+                public C() { }
+                ~C() { }
+                public int P { get; set; }
+                public int this[int i] => i;
+                public static C operator +(C l, C r) => l;
+                public static implicit operator int(C c) => 0;
+                public void M(int x) { void Local() { } Local(); }
+            }
+        }
+        """;
+
+    private static CypherNode Declaration(CypherDocument doc, string label, string? name = null) =>
+        doc.Nodes.Single(n => n.Labels.Contains(label) && (name is null || n.Properties["name"] as string == name));
+
+    [Theory]
+    [InlineData("CSharpNamespaceDeclaration", null, "N", "Namespace")]
+    [InlineData("CSharpClassDeclaration", null, "N.C", "NamedType")]
+    [InlineData("CSharpStructDeclaration", null, "N.S", "NamedType")]
+    [InlineData("CSharpRecordDeclaration", null, "N.R", "NamedType")]
+    [InlineData("CSharpRecordStructDeclaration", null, "N.RS", "NamedType")]
+    [InlineData("CSharpInterfaceDeclaration", null, "N.I", "NamedType")]
+    [InlineData("CSharpEnumDeclaration", null, "N.E", "NamedType")]
+    [InlineData("CSharpEnumMember", "A", "N.E.A", "Field")]
+    [InlineData("CSharpDelegateDeclaration", null, "N.D", "NamedType")]
+    [InlineData("CSharpMethodDeclaration", "M", "N.C.M(int)", "Method")]
+    [InlineData("CSharpMethodDeclaration", "Run", "N.I.Run()", "Method")]
+    [InlineData("CSharpConstructorDeclaration", null, "N.C.C()", "Method")]
+    [InlineData("CSharpDestructorDeclaration", null, "N.C.~C()", "Method")]
+    [InlineData("CSharpOperatorDeclaration", null, "N.C.operator +(N.C, N.C)", "Method")]
+    [InlineData("CSharpConversionOperatorDeclaration", null, "N.C.implicit operator int(N.C)", "Method")]
+    [InlineData("CSharpPropertyDeclaration", null, "N.C.P", "Property")]
+    [InlineData("CSharpIndexerDeclaration", null, "N.C.this[int]", "Property")]
+    [InlineData("CSharpEventDeclaration", null, "N.C.Ev2", "Event")]
+    [InlineData("CSharpVariableDeclarator", "Ev1", "N.C.Ev1", "Event")]
+    [InlineData("CSharpVariableDeclarator", "a", "N.C.a", "Field")]
+    [InlineData("CSharpLocalFunctionDeclaration", null, "Local()", "Method")]
+    public void Declaration_carries_declared_symbol(string label, string? name, string symbolName, string symbolKind)
+    {
+        var doc = BuildWithModel(AllDeclarationsSource);
+        var node = Declaration(doc, label, name);
+        Assert.Equal(symbolName, node.Properties["symbolName"]);
+        Assert.Equal(symbolKind, node.Properties["symbolKind"]);
+    }
+
+    [Fact]
+    public void Overloads_get_distinct_symbol_names()
+    {
+        var doc = BuildWithModel("class C { void M(int i) { } void M(string s) { } }");
+        var names = doc.Nodes.Where(n => n.Labels.Contains("CSharpMethodDeclaration"))
+            .Select(n => n.Properties["symbolName"])
+            .ToList();
+        Assert.Equal(new object?[] { "C.M(int)", "C.M(string)" }, names);
+    }
+
+    [Fact]
+    public void Partial_class_parts_share_one_symbol_name()
+    {
+        var doc = BuildWithModel("partial class P { } partial class P { }");
+        var names = doc.Nodes.Where(n => n.Labels.Contains("CSharpClassDeclaration"))
+            .Select(n => n.Properties["symbolName"])
+            .ToList();
+        Assert.Equal(new object?[] { "P", "P" }, names);
+    }
+
+    [Fact]
+    public void Multi_variable_field_gets_one_symbol_per_declarator()
+    {
+        var doc = BuildWithModel("class C { int a, b; }");
+        var field = Declaration(doc, "CSharpFieldDeclaration");
+        Assert.False(field.Properties.ContainsKey("symbolName"));
+        var declarators = doc.Nodes.Where(n => n.Labels.Contains("CSharpVariableDeclarator")).ToList();
+        Assert.Equal(new object?[] { "C.a", "C.b" }, declarators.Select(n => n.Properties["symbolName"]));
+        Assert.All(declarators, n => Assert.Equal("Field", n.Properties["symbolKind"]));
+    }
+
+    [Fact]
+    public void Without_semantic_model_no_declared_symbol_properties()
+    {
+        var doc = Build(AllDeclarationsSource);
+        Assert.DoesNotContain(doc.Nodes, n => n.Properties.ContainsKey("symbolName") || n.Properties.ContainsKey("symbolKind"));
+    }
 }
 
 public class SouffleWriterTests

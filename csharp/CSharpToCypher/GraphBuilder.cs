@@ -247,7 +247,31 @@ public sealed class GraphBuilder
     }
 
     private string CreateDeclarationNode(SyntaxNode syntax, string specific, IEnumerable<KeyValuePair<string, object?>> props)
-        => CreateNode(syntax, new[] { specific, "CSharpDeclaration" }, props);
+        => CreateNode(syntax, new[] { specific, "CSharpDeclaration" }, props.Concat(DeclaredSymbolProps(syntax)));
+
+    /// <summary>
+    /// The symbol a declaration introduces, as <c>symbolName</c> (fully qualified,
+    /// in the same <see cref="QualifiedFormat"/> used for CFG scopes, expressions
+    /// and <c>CALLS</c> targets) and <c>symbolKind</c>, so declarations can be
+    /// joined to anything keyed by symbol. Yields nothing without a semantic
+    /// model, or when the syntax declares no symbol (e.g. a field declaration,
+    /// whose symbols live on its variable declarators). Parts of a partial type
+    /// or method each get a node, all sharing one <c>symbolName</c>.
+    /// </summary>
+    private IEnumerable<KeyValuePair<string, object?>> DeclaredSymbolProps(SyntaxNode syntax)
+    {
+        if (_model is null)
+        {
+            yield break;
+        }
+        var symbol = _model.GetDeclaredSymbol(syntax);
+        if (symbol is null)
+        {
+            yield break;
+        }
+        yield return KV("symbolName", symbol.ToDisplayString(QualifiedFormat));
+        yield return KV("symbolKind", symbol.Kind.ToString());
+    }
 
     private string CreateStatementNode(SyntaxNode syntax, string specific, IEnumerable<KeyValuePair<string, object?>> props)
         => CreateNode(syntax, new[] { specific, "CSharpStatement" }, props);
@@ -1391,7 +1415,7 @@ public sealed class GraphBuilder
                     KV("returnType", lf.ReturnType.ToString()),
                     KV("isStatic", lf.Modifiers.Any(SyntaxKind.StaticKeyword)),
                     KV("isAsync", lf.Modifiers.Any(SyntaxKind.AsyncKeyword)),
-                });
+                }.Concat(DeclaredSymbolProps(lf)));
                 _methodStack.Push(id);
                 AddRel(parentId, parentEdge, id);
                 BuildAttributeLists(lf.AttributeLists, id);

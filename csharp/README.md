@@ -103,6 +103,19 @@ unrelated node from another file). The generic labels `CSharpDeclaration`,
 `CSharpStatement` and `CSharpExpression` are added so
 `MATCH (s:CSharpStatement)` matches any statement kind.
 
+When a semantic model is available (always, from the CLI), every node for a
+construct that declares a symbol — namespaces, types, enum members, delegates,
+methods, constructors, destructors, operators, conversion operators,
+properties, indexers, events, local functions, type parameters, and each
+`CSharpVariableDeclarator` (one per field, event field or local variable) —
+also carries `symbolName`, the fully qualified symbol (e.g.
+`SampleApp.Models.Dog.Fly()`, `N.C.this[int]`, `N.C.a`), and `symbolKind`
+(Roslyn's `SymbolKind`: `NamedType`, `Method`, `Property`, `Field`, `Event`,
+`Local`, …). The names use the same format as CFG `scope`s, expression
+`symbolName`s and `CALLS` targets, so declarations join to them by value.
+A `CSharpFieldDeclaration` itself has none: the symbols live on its
+declarators, so `int a, b;` gives two declarators named `…a` and `…b`.
+
 ## Node labels (a selection)
 
 | Label | Source construct |
@@ -238,6 +251,10 @@ C# function scopes use the resolved symbol (e.g. `SampleApp.Models.Dog.Fly()`).
   index per node label on `id` first (e.g.
   `CREATE INDEX FOR (n:CSharpDeclaration) ON (n.id);`) so those lookups
   aren't full label scans.
+* **Partial declarations**: each part of a `partial` type or method is its
+  own declaration node, and all parts share one `symbolName`. So
+  `symbolName` is not a unique key for declarations; use it to group the parts
+  (`MATCH (d:CSharpDeclaration {symbolName: 'N.P'})`) rather than as an id.
 * **Trivia**: `SyntaxTrivia` includes whitespace and end-of-line trivia, which
   is filtered out; only comments and preprocessor directives are emitted.
 * **Expressions** are deliberately shallow "for now": operators are stored as
